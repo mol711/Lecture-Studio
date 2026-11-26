@@ -41,6 +41,12 @@ pub enum SecurityError {
         detail: String,
     },
 
+    #[error("[HARD_DISK_QUOTA_UNAVAILABLE / -32002] {user_message}")]
+    HardDiskQuotaUnavailable {
+        user_message: String,
+        detail: String,
+    },
+
     #[error("[{code} / -32003] {user_message}")]
     StagingInspection {
         code: &'static str,
@@ -71,6 +77,7 @@ impl SecurityError {
             Self::InvalidParams { .. } => "INVALID_PARAMS",
             Self::PolicyDenied { code, .. } => code,
             Self::SandboxUnavailable { .. } => "SANDBOX_UNAVAILABLE",
+            Self::HardDiskQuotaUnavailable { .. } => "HARD_DISK_QUOTA_UNAVAILABLE",
             Self::StagingInspection { code, .. } => code,
             Self::AuditFailure { .. } => "AUDIT_FAILURE",
             Self::CancelledOrTimedOut { .. } => "CANCELLED_OR_TIMED_OUT",
@@ -85,7 +92,7 @@ impl SecurityError {
             Self::OperationNotAllowed { .. } => -32601,
             Self::InvalidParams { .. } => -32602,
             Self::PolicyDenied { .. } => -32001,
-            Self::SandboxUnavailable { .. } => -32002,
+            Self::SandboxUnavailable { .. } | Self::HardDiskQuotaUnavailable { .. } => -32002,
             Self::StagingInspection { .. } => -32003,
             Self::AuditFailure { .. } => -32004,
             Self::CancelledOrTimedOut { .. } => -32005,
@@ -101,6 +108,7 @@ impl SecurityError {
             | Self::InvalidParams { user_message, .. }
             | Self::PolicyDenied { user_message, .. }
             | Self::SandboxUnavailable { user_message, .. }
+            | Self::HardDiskQuotaUnavailable { user_message, .. }
             | Self::StagingInspection { user_message, .. }
             | Self::AuditFailure { user_message, .. }
             | Self::CancelledOrTimedOut { user_message, .. } => user_message,

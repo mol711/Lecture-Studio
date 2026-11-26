@@ -110,3 +110,25 @@ def test_dummy_worker_benign_and_runner_help(tmp_path: pathlib.Path) -> None:
         check=True,
     )
     assert "--spec-b64" in runner_help.stdout
+    assert "--inner-exec" in runner_help.stdout
+
+    # Verify zero-sleep burst modes are wired cleanly in worker.py
+    inode_dir = tmp_path / "inodes"
+    inode_dir.mkdir()
+    proc_inodes = subprocess.run(
+        [
+            sys.executable,
+            str(WORKER_SCRIPT),
+            "--mode",
+            "resource_disk_inodes",
+            "--output",
+            str(inode_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "DISK_INODES_COMPLETED=64" in proc_inodes.stdout
+
+    worker_src = WORKER_SCRIPT.read_text(encoding="utf-8")
+    assert "def mode_resource_disk_spray_fast" in worker_src

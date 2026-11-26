@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use lecture_studio_security::sandbox::{create_sandbox_backend, SandboxedProcessSpec};
-use lecture_studio_security::staging::measure_staging_usage;
+use lecture_studio_security::staging::{measure_staging_usage, purge_oversized_staging};
 use lecture_studio_security::{
     Actor, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest, JobStatus,
     Operation, PolicyEngine, Purpose, ResourceLimits, SandboxMode, SecurityGateway,
@@ -383,7 +383,7 @@ fn linux_bwrap_cgroups_seccomp_security_boundaries() {
     assert!(r_stdio.diagnostics[0].message.len() <= 32 * 1024 + 128);
     assert!(!stdio_out.exists());
 
-    // 7. SEC-04 (Finding 3): Linux kernel RLIMIT_FSIZE + runtime staging cap + bounded /tmp tmpfs
+    // 7. SEC-04: Kernel tmpfs capacity & inode caps (zero-sleep bursts -> ENOSPC) + /tmp cap
     let st_l_disk1 = tmp.path().join("st_l_disk1");
     let r_disk1 = gw
         .execute_dummy_job(
@@ -411,14 +411,13 @@ fn linux_bwrap_cgroups_seccomp_security_boundaries() {
             },
         )
         .unwrap();
-    assert!(
-        matches!(r_disk1.status, JobStatus::Cancelled | JobStatus::Failed),
-        "single-file disk flood must not commit or pass: {:?}",
-        r_disk1
-    );
-    let (_, d1_bytes) = measure_staging_usage(&st_l_disk1).unwrap();
+    assert_eq!(r_disk1.status, JobStatus::Cancelled);
+    assert_eq!(r_disk1.diagnostics[0].code, "DISK_LIMIT_EXCEEDED");
+    let (d1_files, d1_bytes) = measure_staging_usage(&st_l_disk1).unwrap();
+    assert_eq!(d1_files, 0);
     assert_eq!(d1_bytes, 0);
 
+    // Zero-sleep multi-file write burst through Gateway -> cancelled + host staging clean
     let st_l_disk2 = tmp.path().join("st_l_disk2");
     let r_disk2 = gw
         .execute_dummy_job(
@@ -439,7 +438,7 @@ fn linux_bwrap_cgroups_seccomp_security_boundaries() {
                 worker_script: &worker,
                 worker_args: &[
                     "--mode".into(),
-                    "resource_disk_spray".into(),
+                    "resource_disk_spray_fast".into(),
                     "--output".into(),
                     "{STAGING_DIR}".into(),
                 ],
@@ -451,6 +450,127 @@ fn linux_bwrap_cgroups_seccomp_security_boundaries() {
     let (d2_files, d2_bytes) = measure_staging_usage(&st_l_disk2).unwrap();
     assert_eq!(d2_files, 0);
     assert_eq!(d2_bytes, 0);
+
+    // Direct backend proof: zero-sleep multi-file burst hits kernel ENOSPC (errno 28)
+    let st_l_fast_direct = tmp.path().join("st_l_fast_direct");
+    let fast_direct = backend
+        .run(&SandboxedProcessSpec {
+            job_id: "l-sec04-fast-enospc".into(),
+            worker_script: worker.clone(),
+            input_dir: in_dir.clone(),
+            staging_dir: st_l_fast_direct.clone(),
+            worker_args: vec![
+                "--mode".into(),
+                "resource_disk_spray_fast".into(),
+                "--output".into(),
+                "{STAGING_DIR}".into(),
+            ],
+            limits: ResourceLimits {
+                max_output_bytes: 256 * 1024,
+                ..ResourceLimits::default()
+            },
+        })
+        .unwrap();
+    assert!(fast_direct.disk_limit_exceeded);
+    assert!(
+        fast_direct.stdout.contains("BLOCKED_DISK_SPRAY_FAST:")
+            && fast_direct.stdout.contains("errno=28"),
+        "expected kernel ENOSPC (errno=28) on zero-sleep burst, got: {}",
+        fast_direct.stdout
+    );
+    let (fd_files, fd_bytes) = measure_staging_usage(&st_l_fast_direct).unwrap();
+    assert_eq!(fd_files, 0);
+    assert_eq!(fd_bytes, 0);
+
+    // Direct backend + Gateway proof: zero-sleep inode burst hits kernel ENOSPC at nr_inodes cap
+    let st_l_inodes = tmp.path().join("st_l_inodes");
+    let inode_direct = backend
+        .run(&SandboxedProcessSpec {
+            job_id: "l-sec04-inodes".into(),
+            worker_script: worker.clone(),
+            input_dir: in_dir.clone(),
+            staging_dir: st_l_inodes.clone(),
+            worker_args: vec![
+                "--mode".into(),
+                "resource_disk_inodes".into(),
+                "--output".into(),
+                "{STAGING_DIR}".into(),
+            ],
+            limits: ResourceLimits::default(),
+        })
+        .unwrap();
+    assert!(inode_direct.disk_limit_exceeded);
+    assert!(
+        inode_direct.stdout.contains("BLOCKED_DISK_INODES:")
+            && inode_direct.stdout.contains("errno=28"),
+        "expected kernel ENOSPC (errno=28) on inode burst, got: {}",
+        inode_direct.stdout
+    );
+    let (inode_files, inode_bytes) = measure_staging_usage(&st_l_inodes).unwrap();
+    assert_eq!(inode_files, 0);
+    assert_eq!(inode_bytes, 0);
+
+    // Purge failure / tainted staging cannot be reused through the Linux/WSL2 Gateway
+    let st_l_tainted = tmp.path().join("st_l_tainted");
+    fs::create_dir_all(&st_l_tainted).unwrap();
+    #[cfg(windows)]
+    let _locked_l_guard = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let locked_p = st_l_tainted.join("locked.bin");
+        fs::write(&locked_p, vec![b'Z'; 512]).unwrap();
+        Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&locked_p)
+                .unwrap(),
+        )
+    };
+    #[cfg(unix)]
+    let locked_l_sub = {
+        use std::os::unix::fs::PermissionsExt;
+        let sub = st_l_tainted.join("locked_sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("locked.bin"), vec![b'Z'; 512]).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        sub
+    };
+    let purge_err =
+        purge_oversized_staging(&st_l_tainted, &quarantine_dir, "job-l-taint", "DISK_LIMIT")
+            .unwrap_err();
+    assert_eq!(purge_err.code(), "STAGING_PURGE_FAILED");
+    let tainted_reuse = gw
+        .execute_dummy_job(
+            &make_req(
+                "job-l-taint-reuse",
+                "req-l-taint-reuse",
+                &in_hash,
+                "out.json",
+            ),
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_l_tainted,
+                official_output_file: &official_dir.join("should_not_exist_l_taint.json"),
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[],
+            },
+        )
+        .unwrap();
+    assert_eq!(tainted_reuse.status, JobStatus::Failed);
+    assert_eq!(tainted_reuse.error_code, Some(-32003));
+    assert_eq!(tainted_reuse.diagnostics[0].code, "STAGING_TAINTED");
+    assert_eq!(tainted_reuse.metrics.exit_code, None);
+    #[cfg(windows)]
+    drop(_locked_l_guard);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&locked_l_sub, fs::Permissions::from_mode(0o755));
+    }
 
     // Verify bwrap --size --tmpfs /tmp + RLIMIT_FSIZE blocks /tmp flood inside container
     let tmp_flood_res = backend

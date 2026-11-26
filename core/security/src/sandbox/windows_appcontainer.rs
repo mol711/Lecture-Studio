@@ -3,6 +3,9 @@
 use crate::errors::SecurityError;
 use crate::sandbox::{IsolatedProcessResult, SandboxBackend, SandboxedProcessSpec};
 
+pub const WINDOWS_STAGING_VOLUME_ENV: &str = "LECTURE_STUDIO_WINDOWS_STAGING_VOLUME";
+pub const MAX_BOUNDED_STAGING_VOLUME_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsAppContainerJobBackend;
 
@@ -27,7 +30,9 @@ mod imp {
     use windows_sys::Win32::Security::{
         FreeSid, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     };
-    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetVolumePathNameW, ReadFile,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAndIoAccountingInformation,
         JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
@@ -46,6 +51,7 @@ mod imp {
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
 
+    use super::MAX_BOUNDED_STAGING_VOLUME_BYTES;
     use crate::errors::SecurityError;
     use crate::sandbox::{IsolatedProcessResult, SandboxedProcessSpec};
     use crate::staging::measure_staging_usage;
@@ -269,7 +275,111 @@ mod imp {
         String::from_utf8_lossy(&collected).trim().to_string()
     }
 
+    fn verify_bounded_staging_volume(
+        staging_dir: &Path,
+        max_output_bytes: u64,
+    ) -> Result<(), SecurityError> {
+        let mut probe = fs::canonicalize(staging_dir).unwrap_or_else(|_| staging_dir.to_path_buf());
+        while !probe.exists() {
+            let Some(parent) = probe.parent() else {
+                break;
+            };
+            probe = parent.to_path_buf();
+        }
+        if !probe.exists() {
+            return Err(SecurityError::HardDiskQuotaUnavailable {
+                user_message:
+                    "Cannot resolve existing volume for Windows staging directory; refusing execution (fail-closed)."
+                        .to_string(),
+                detail: staging_dir.display().to_string(),
+            });
+        }
+        let probe_canon = fs::canonicalize(&probe).unwrap_or(probe);
+        let probe_raw = probe_canon.to_string_lossy();
+        let probe_clean = probe_raw.strip_prefix(r"\\?\").unwrap_or(&probe_raw);
+        let probe_w = to_wide_nul(probe_clean);
+
+        let mut vol_buf = vec![0u16; 512];
+        // SAFETY: `probe_w` is NUL-terminated UTF-16 path and `vol_buf` is 512 WCHARs.
+        let got_vol = unsafe {
+            GetVolumePathNameW(probe_w.as_ptr(), vol_buf.as_mut_ptr(), vol_buf.len() as u32)
+        };
+        if got_vol == 0 {
+            return Err(SecurityError::HardDiskQuotaUnavailable {
+                user_message:
+                    "Failed querying Windows volume for staging directory; refusing execution (fail-closed)."
+                        .to_string(),
+                detail: format!("WinError={} path={probe_clean}", unsafe { GetLastError() }),
+            });
+        }
+        let nul_idx = vol_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(vol_buf.len());
+        let vol_root = String::from_utf16_lossy(&vol_buf[..nul_idx]);
+
+        if let Ok(sys_drive) = std::env::var("SystemDrive") {
+            let sys_prefix = format!("{}\\", sys_drive.trim_end_matches('\\'));
+            if vol_root.eq_ignore_ascii_case(&sys_prefix) {
+                return Err(SecurityError::HardDiskQuotaUnavailable {
+                    user_message:
+                        "Windows AppContainer requires a dedicated capacity-bounded staging volume (e.g., pre-mounted VHDX <= 64 MiB); refusing execution on host system drive before worker launch."
+                            .to_string(),
+                    detail: format!("volume={vol_root}"),
+                });
+            }
+        }
+
+        let vol_w = to_wide_nul(&vol_root);
+        let mut free_avail = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_free = 0u64;
+        // SAFETY: valid NUL-terminated volume path and initialized output integers.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                vol_w.as_ptr(),
+                &mut free_avail,
+                &mut total_bytes,
+                &mut total_free,
+            )
+        };
+        if ok == 0 {
+            return Err(SecurityError::HardDiskQuotaUnavailable {
+                user_message:
+                    "Failed querying Windows staging volume capacity; refusing execution (fail-closed)."
+                        .to_string(),
+                detail: format!("WinError={} volume={vol_root}", unsafe { GetLastError() }),
+            });
+        }
+
+        let allowed_volume_cap =
+            MAX_BOUNDED_STAGING_VOLUME_BYTES.max(max_output_bytes.saturating_mul(2));
+        if total_bytes == 0 || total_bytes > allowed_volume_cap {
+            return Err(SecurityError::HardDiskQuotaUnavailable {
+                user_message:
+                    "Windows AppContainer staging volume exceeds bounded capacity ceiling; refusing execution before worker launch."
+                        .to_string(),
+                detail: format!(
+                    "volume={vol_root} total_bytes={total_bytes} cap={allowed_volume_cap}"
+                ),
+            });
+        }
+        if free_avail < max_output_bytes {
+            return Err(SecurityError::HardDiskQuotaUnavailable {
+                user_message:
+                    "Windows AppContainer bounded staging volume has insufficient free space."
+                        .to_string(),
+                detail: format!(
+                    "volume={vol_root} free_avail={free_avail} required={max_output_bytes}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub fn run(spec: &SandboxedProcessSpec) -> Result<IsolatedProcessResult, SecurityError> {
+        verify_bounded_staging_volume(&spec.staging_dir, spec.limits.max_output_bytes)?;
+
         fs::create_dir_all(&spec.staging_dir).map_err(|e| SecurityError::SandboxUnavailable {
             user_message: "Failed creating Windows staging directory.".to_string(),
             detail: e.to_string(),

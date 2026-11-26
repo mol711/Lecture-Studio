@@ -19,13 +19,20 @@ mod imp {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use tempfile::NamedTempFile;
+    use tempfile::{Builder, NamedTempFile};
     use uuid::Uuid;
 
     use crate::errors::SecurityError;
     use crate::sandbox::seccomp_bpf::build_x86_64_seccomp_bpf;
     use crate::sandbox::{IsolatedProcessResult, SandboxedProcessSpec};
-    use crate::staging::measure_staging_usage;
+
+    #[derive(serde::Deserialize)]
+    struct InnerResult {
+        exit_code: i32,
+        disk_limit_exceeded: bool,
+        #[serde(default)]
+        staging_violations: Vec<String>,
+    }
 
     fn drain_reader_bounded<R: Read>(
         reader: Option<R>,
@@ -72,13 +79,18 @@ mod imp {
     }
 
     pub fn is_available() -> bool {
-        cfg!(target_arch = "x86_64") && cmd_exists("bwrap") && cmd_exists("systemd-run")
+        cfg!(target_arch = "x86_64")
+            && cmd_exists("bwrap")
+            && cmd_exists("systemd-run")
+            && cmd_exists("unshare")
+            && cmd_exists("mount")
+            && cmd_exists("python3")
     }
 
     pub fn run(spec: &SandboxedProcessSpec) -> Result<IsolatedProcessResult, SecurityError> {
         if !is_available() {
             return Err(SecurityError::SandboxUnavailable {
-                user_message: "Linux Bubblewrap/systemd-run sandbox is unavailable.".to_string(),
+                user_message: "Linux Bubblewrap/unshare/mount sandbox is unavailable.".to_string(),
                 detail: "linux_bwrap".to_string(),
             });
         }
@@ -87,6 +99,21 @@ mod imp {
             user_message: "Failed to prepare Linux staging directory.".to_string(),
             detail: e.to_string(),
         })?;
+
+        let tmp_work = Builder::new()
+            .prefix("ls_bwrap_tmpfs_")
+            .tempdir()
+            .map_err(|e| SecurityError::SandboxUnavailable {
+                user_message: "Failed creating temporary Linux work directory.".to_string(),
+                detail: e.to_string(),
+            })?;
+        let mnt_staging = tmp_work.path().join("mnt_staging");
+        fs::create_dir_all(&mnt_staging).map_err(|e| SecurityError::SandboxUnavailable {
+            user_message: "Failed creating tmpfs staging mountpoint.".to_string(),
+            detail: e.to_string(),
+        })?;
+        let inner_result_path = tmp_work.path().join("inner_result.json");
+        let inner_spec_path = tmp_work.path().join("inner_spec.json");
 
         let mut tmp_bpf = NamedTempFile::new().map_err(|e| SecurityError::SandboxUnavailable {
             user_message: "Failed creating temporary seccomp-bpf file.".to_string(),
@@ -119,7 +146,71 @@ mod imp {
             })
             .collect();
 
-        let max_tmp_bytes = spec.limits.max_output_bytes.max(65_536);
+        let max_out_bytes = spec.limits.max_output_bytes;
+        let max_tmp_bytes = max_out_bytes.max(65_536);
+        let staging_cap_bytes = max_out_bytes
+            .saturating_add(4095)
+            .checked_div(4096)
+            .unwrap_or(1)
+            .saturating_mul(4096)
+            .max(4096);
+
+        let inner_spec = serde_json::json!({
+            "in_dir": spec.input_dir.to_string_lossy(),
+            "mnt_dir": mnt_staging.to_string_lossy(),
+            "host_st": spec.staging_dir.to_string_lossy(),
+            "worker_script": spec.worker_script.to_string_lossy(),
+            "worker_args": resolved_args,
+            "max_out_bytes": max_out_bytes,
+            "tmp_cap_bytes": max_tmp_bytes,
+            "staging_cap_bytes": staging_cap_bytes,
+            "staging_nr_inodes": 33,
+            "result_file": inner_result_path.to_string_lossy(),
+            "bpf_fd": bpf_fd,
+        });
+        fs::write(&inner_spec_path, inner_spec.to_string()).map_err(|e| {
+            SecurityError::SandboxUnavailable {
+                user_message: "Failed writing Linux tmpfs wrapper spec.".to_string(),
+                detail: e.to_string(),
+            }
+        })?;
+
+        let wrapper_py = r#"
+import json, os, pathlib, shutil, stat, subprocess, sys
+s = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+mnt, host_st = pathlib.Path(s['mnt_dir']), pathlib.Path(s['host_st'])
+max_out = int(s['max_out_bytes'])
+subprocess.run(['mount', '-t', 'tmpfs', '-o', f"size={s['staging_cap_bytes']},nr_inodes={s['staging_nr_inodes']},mode=0700", 'tmpfs', str(mnt)], check=True)
+cmd = ['prlimit', f'--fsize={max_out}', '--', 'bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--clearenv', '--setenv', 'PATH', '/usr/bin:/bin', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--symlink', 'usr/bin', '/bin']
+for p in ('/etc/alternatives', '/etc/ld.so.cache'):
+    if pathlib.Path(p).exists():
+        cmd.extend(['--ro-bind', p, p])
+cmd.extend(['--proc', '/proc', '--dev', '/dev', '--size', str(s['tmp_cap_bytes']), '--tmpfs', '/tmp', '--ro-bind', s['in_dir'], '/work/in', '--bind', str(mnt), '/work/staging', '--ro-bind', s['worker_script'], '/work/worker.py', '--chdir', '/work/staging', '--seccomp', str(s['bpf_fd']), '/usr/bin/python3', '-I', '-X', 'utf8', '/work/worker.py', *s['worker_args']])
+proc = subprocess.run(cmd, pass_fds=(int(s['bpf_fd']),))
+rc = int(proc.returncode)
+sv = os.statvfs(mnt)
+files, total_b, violations, regs = 0, 0, [], []
+for dp, dn, fn in os.walk(mnt, followlinks=False):
+    dpp = pathlib.Path(dp)
+    dn[:] = [d for d in dn if not stat.S_ISLNK(os.lstat(dpp / d).st_mode)]
+    for f in fn:
+        p = dpp / f
+        st = os.lstat(p)
+        rel = p.relative_to(mnt).as_posix()
+        if stat.S_ISLNK(st.st_mode): violations.append(f'SYMLINK_IN_STAGING:{rel}')
+        elif not stat.S_ISREG(st.st_mode): violations.append(f'NON_REGULAR_IN_STAGING:{rel}')
+        else: files += 1; total_b += st.st_size; regs.append(p)
+fsize_killed = rc in (-25, 153)
+space_exhausted = (rc != 0 and (sv.f_bavail == 0 or sv.f_favail == 0)) or (sv.f_blocks > 1 and sv.f_bavail == 0) or sv.f_favail == 0
+disk_exceeded = files > 32 or total_b > max_out or fsize_killed or space_exhausted
+if not disk_exceeded and not violations and rc == 0:
+    for src in regs:
+        dst = host_st / src.relative_to(mnt)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+pathlib.Path(s['result_file']).write_text(json.dumps({'exit_code': rc, 'disk_limit_exceeded': disk_exceeded, 'staging_violations': violations}), encoding='utf-8')
+"#;
+
         let mut cmd = Command::new("systemd-run");
         cmd.args([
             "--user",
@@ -137,65 +228,16 @@ mod imp {
             "-p",
             &format!("CPUQuota={}%", spec.limits.cpu_quota_percent),
             "--",
-            "prlimit",
-            &format!("--fsize={}", spec.limits.max_output_bytes),
+            "unshare",
+            "-Ur",
+            "-m",
             "--",
-            "bwrap",
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/bin:/bin",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--symlink",
-            "usr/lib",
-            "/lib",
-            "--symlink",
-            "usr/lib64",
-            "/lib64",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-        ]);
-        if Path::new("/etc/alternatives").exists() {
-            cmd.args(["--ro-bind", "/etc/alternatives", "/etc/alternatives"]);
-        }
-        if Path::new("/etc/ld.so.cache").exists() {
-            cmd.args(["--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"]);
-        }
-        cmd.args([
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--size",
-            &max_tmp_bytes.to_string(),
-            "--tmpfs",
-            "/tmp",
-            "--ro-bind",
-            &spec.input_dir.to_string_lossy(),
-            "/work/in",
-            "--bind",
-            &spec.staging_dir.to_string_lossy(),
-            "/work/staging",
-            "--ro-bind",
-            &spec.worker_script.to_string_lossy(),
-            "/work/worker.py",
-            "--chdir",
-            "/work/staging",
-            "--seccomp",
-            &bpf_fd.to_string(),
             "/usr/bin/python3",
             "-I",
-            "-X",
-            "utf8",
-            "/work/worker.py",
+            "-c",
+            wrapper_py,
+            &inner_spec_path.to_string_lossy(),
         ]);
-        cmd.args(&resolved_args);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -231,7 +273,6 @@ mod imp {
         let timeout = Duration::from_millis(spec.limits.timeout_ms);
         let mut timed_out = false;
         let mut stdio_limit_exceeded = false;
-        let mut disk_limit_exceeded = false;
         let kill_scope = |child: &mut std::process::Child| {
             let _ = Command::new("systemctl")
                 .args(["--user", "kill", &unit_name])
@@ -260,15 +301,6 @@ mod imp {
                     detail: e.to_string(),
                 })?;
             }
-            if measure_staging_usage(&spec.staging_dir)
-                .is_ok_and(|(files, bytes)| files > 32 || bytes > spec.limits.max_output_bytes)
-            {
-                disk_limit_exceeded = true;
-                break kill_scope(&mut child).map_err(|e| SecurityError::SandboxUnavailable {
-                    user_message: "Failed killing process after staging disk overflow.".to_string(),
-                    detail: e.to_string(),
-                })?;
-            }
             if t0.elapsed() >= timeout {
                 timed_out = true;
                 break kill_scope(&mut child).map_err(|e| SecurityError::SandboxUnavailable {
@@ -284,25 +316,33 @@ mod imp {
         if stdio_overflow.load(Ordering::SeqCst) {
             stdio_limit_exceeded = true;
         }
-        if !stdio_limit_exceeded
-            && !timed_out
-            && measure_staging_usage(&spec.staging_dir)
-                .is_ok_and(|(files, bytes)| files > 32 || bytes > spec.limits.max_output_bytes)
-        {
-            disk_limit_exceeded = true;
-        }
         let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let mut exit_code = status.code().unwrap_or(-15);
+        let mut disk_limit_exceeded = false;
+        let mut staging_violations = Vec::new();
+        if !stdio_limit_exceeded && !timed_out {
+            if let Ok(raw) = fs::read_to_string(&inner_result_path) {
+                if let Ok(parsed) = serde_json::from_str::<InnerResult>(&raw) {
+                    exit_code = parsed.exit_code;
+                    disk_limit_exceeded = parsed.disk_limit_exceeded;
+                    staging_violations = parsed.staging_violations;
+                }
+            } else if exit_code == 0 {
+                exit_code = -1;
+            }
+        }
 
         Ok(IsolatedProcessResult {
             backend_name: "linux_bwrap".to_string(),
-            exit_code: status.code().unwrap_or(-15),
+            exit_code,
             timed_out,
             stdio_limit_exceeded,
             disk_limit_exceeded,
             stdout,
             stderr,
             duration_ms,
-            staging_violations: Vec::new(),
+            staging_violations,
         })
     }
 }

@@ -1,7 +1,8 @@
 //! SecurityGateway: 6-stage fail-closed orchestrator across switchable OS sandboxes.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::audit::{AuditAppendInput, HashChainedAuditLog};
 use crate::errors::SecurityError;
@@ -12,8 +13,8 @@ use crate::models::{
 use crate::policy::PolicyEngine;
 use crate::sandbox::{create_sandbox_backend, SandboxBackend, SandboxedProcessSpec};
 use crate::staging::{
-    atomic_promote, purge_oversized_staging, quarantine_staging, validate_relative_staging_ref,
-    StagingInspector,
+    atomic_promote, ensure_clean_staging_dir, is_staging_tainted, purge_oversized_staging,
+    quarantine_staging, validate_relative_staging_ref, StagingInspector,
 };
 
 pub struct SecurityGateway {
@@ -23,6 +24,7 @@ pub struct SecurityGateway {
     pub wsl_distro: String,
     pub healthy: bool,
     seen_idempotency_keys: HashSet<(String, String, u64, String)>,
+    tainted_staging_dirs: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +55,45 @@ impl SecurityGateway {
             wsl_distro: wsl_distro.into(),
             healthy,
             seen_idempotency_keys: HashSet::new(),
+            tainted_staging_dirs: HashSet::new(),
         }
+    }
+
+    fn mark_staging_tainted(&mut self, staging_dir: &Path) {
+        self.tainted_staging_dirs.insert(staging_dir.to_path_buf());
+        if let Ok(canon) = fs::canonicalize(staging_dir) {
+            self.tainted_staging_dirs.insert(canon);
+        }
+    }
+
+    fn is_staging_tainted_in_gateway(&self, staging_dir: &Path) -> bool {
+        if is_staging_tainted(staging_dir) || self.tainted_staging_dirs.contains(staging_dir) {
+            return true;
+        }
+        fs::canonicalize(staging_dir).is_ok_and(|canon| self.tainted_staging_dirs.contains(&canon))
+    }
+
+    fn handle_cleanup_failure(
+        &mut self,
+        req: &JobRequest,
+        staging_dir: &Path,
+        err: &SecurityError,
+        diagnostics: &mut Vec<DiagnosticItem>,
+    ) -> Result<(), SecurityError> {
+        self.mark_staging_tainted(staging_dir);
+        diagnostics.push(DiagnosticItem {
+            severity: "error".to_string(),
+            code: err.code().to_string(),
+            message: err.user_message().to_string(),
+        });
+        self.record_audit(
+            req,
+            AuditDecision::FailClosed,
+            err.code(),
+            None,
+            Some(err.jsonrpc_code()),
+        )?;
+        Ok(())
     }
 
     fn record_audit(
@@ -230,6 +270,68 @@ impl SecurityGateway {
             });
         }
 
+        // Stage 2.6: Refuse reuse of tainted or non-empty staging areas BEFORE spawning worker
+        if self.is_staging_tainted_in_gateway(staging_dir) {
+            let aid = self.record_audit(
+                req,
+                AuditDecision::Deny,
+                "STAGING_TAINTED",
+                None,
+                Some(-32003),
+            )?;
+            return Ok(JobResponse {
+                schema_version: "1.0.0".to_string(),
+                job_id: req.job_id.clone(),
+                status: JobStatus::Failed,
+                output_refs: Vec::new(),
+                diagnostics: vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: "STAGING_TAINTED".to_string(),
+                    message:
+                        "Staging directory is tainted after incomplete cleanup and cannot be reused."
+                            .to_string(),
+                }],
+                source_revision: req.input_revision,
+                engine_version: "security-gateway-1.0.0".to_string(),
+                metrics: JobMetrics {
+                    duration_ms: 0.0,
+                    backend: backend_label,
+                    exit_code: None,
+                },
+                audit_id: Some(aid),
+                error_code: Some(-32003),
+            });
+        }
+        if let Err(exc) = ensure_clean_staging_dir(staging_dir) {
+            let aid = self.record_audit(
+                req,
+                AuditDecision::Deny,
+                exc.code(),
+                None,
+                Some(exc.jsonrpc_code()),
+            )?;
+            return Ok(JobResponse {
+                schema_version: "1.0.0".to_string(),
+                job_id: req.job_id.clone(),
+                status: JobStatus::Failed,
+                output_refs: Vec::new(),
+                diagnostics: vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: exc.code().to_string(),
+                    message: exc.user_message().to_string(),
+                }],
+                source_revision: req.input_revision,
+                engine_version: "security-gateway-1.0.0".to_string(),
+                metrics: JobMetrics {
+                    duration_ms: 0.0,
+                    backend: backend_label,
+                    exit_code: None,
+                },
+                audit_id: Some(aid),
+                error_code: Some(exc.jsonrpc_code()),
+            });
+        }
+
         // Stage 3: Policy authorization + Sandbox backend selection (no unsandboxed fallback)
         let rule = match self.policy.evaluate(req, trusted_channel_actor) {
             Ok(r) => r.clone(),
@@ -344,12 +446,19 @@ impl SecurityGateway {
         };
 
         if proc_res.stdio_limit_exceeded {
-            let _ = purge_oversized_staging(
+            let mut diagnostics = vec![DiagnosticItem {
+                severity: "error".to_string(),
+                code: "STDIO_LIMIT_EXCEEDED".to_string(),
+                message: proc_res.stdout,
+            }];
+            if let Err(cleanup_err) = purge_oversized_staging(
                 staging_dir,
                 quarantine_dir,
                 &req.job_id,
                 "STDIO_LIMIT_EXCEEDED",
-            );
+            ) {
+                self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+            }
             let aid = self.record_audit(
                 req,
                 AuditDecision::Deny,
@@ -362,11 +471,7 @@ impl SecurityGateway {
                 job_id: req.job_id.clone(),
                 status: JobStatus::Cancelled,
                 output_refs: Vec::new(),
-                diagnostics: vec![DiagnosticItem {
-                    severity: "error".to_string(),
-                    code: "STDIO_LIMIT_EXCEEDED".to_string(),
-                    message: proc_res.stdout,
-                }],
+                diagnostics,
                 source_revision: req.input_revision,
                 engine_version: "security-gateway-1.0.0".to_string(),
                 metrics: JobMetrics {
@@ -380,12 +485,20 @@ impl SecurityGateway {
         }
 
         if proc_res.disk_limit_exceeded {
-            let _ = purge_oversized_staging(
+            let mut diagnostics = vec![DiagnosticItem {
+                severity: "error".to_string(),
+                code: "DISK_LIMIT_EXCEEDED".to_string(),
+                message: "Worker exceeded runtime staging disk limit and was terminated."
+                    .to_string(),
+            }];
+            if let Err(cleanup_err) = purge_oversized_staging(
                 staging_dir,
                 quarantine_dir,
                 &req.job_id,
                 "DISK_LIMIT_EXCEEDED",
-            );
+            ) {
+                self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+            }
             let aid = self.record_audit(
                 req,
                 AuditDecision::Deny,
@@ -398,12 +511,7 @@ impl SecurityGateway {
                 job_id: req.job_id.clone(),
                 status: JobStatus::Cancelled,
                 output_refs: Vec::new(),
-                diagnostics: vec![DiagnosticItem {
-                    severity: "error".to_string(),
-                    code: "DISK_LIMIT_EXCEEDED".to_string(),
-                    message: "Worker exceeded runtime staging disk limit and was terminated."
-                        .to_string(),
-                }],
+                diagnostics,
                 source_revision: req.input_revision,
                 engine_version: "security-gateway-1.0.0".to_string(),
                 metrics: JobMetrics {
@@ -417,7 +525,14 @@ impl SecurityGateway {
         }
 
         if proc_res.timed_out {
-            let _ = quarantine_staging(staging_dir, quarantine_dir, &req.job_id);
+            let mut diagnostics = vec![DiagnosticItem {
+                severity: "error".to_string(),
+                code: "TIMEOUT_CANCELLED".to_string(),
+                message: proc_res.stdout,
+            }];
+            if let Err(cleanup_err) = quarantine_staging(staging_dir, quarantine_dir, &req.job_id) {
+                self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+            }
             let aid = self.record_audit(
                 req,
                 AuditDecision::Deny,
@@ -430,11 +545,7 @@ impl SecurityGateway {
                 job_id: req.job_id.clone(),
                 status: JobStatus::Cancelled,
                 output_refs: Vec::new(),
-                diagnostics: vec![DiagnosticItem {
-                    severity: "error".to_string(),
-                    code: "TIMEOUT_CANCELLED".to_string(),
-                    message: proc_res.stdout,
-                }],
+                diagnostics,
                 source_revision: req.input_revision,
                 engine_version: "security-gateway-1.0.0".to_string(),
                 metrics: JobMetrics {
@@ -448,7 +559,14 @@ impl SecurityGateway {
         }
 
         if !proc_res.staging_violations.is_empty() {
-            let _ = quarantine_staging(staging_dir, quarantine_dir, &req.job_id);
+            let mut diagnostics = vec![DiagnosticItem {
+                severity: "error".to_string(),
+                code: "STAGING_VIOLATION".to_string(),
+                message: proc_res.staging_violations.join(";"),
+            }];
+            if let Err(cleanup_err) = quarantine_staging(staging_dir, quarantine_dir, &req.job_id) {
+                self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+            }
             let aid = self.record_audit(
                 req,
                 AuditDecision::Quarantine,
@@ -461,11 +579,7 @@ impl SecurityGateway {
                 job_id: req.job_id.clone(),
                 status: JobStatus::Quarantined,
                 output_refs: Vec::new(),
-                diagnostics: vec![DiagnosticItem {
-                    severity: "error".to_string(),
-                    code: "STAGING_VIOLATION".to_string(),
-                    message: proc_res.staging_violations.join(";"),
-                }],
+                diagnostics,
                 source_revision: req.input_revision,
                 engine_version: "security-gateway-1.0.0".to_string(),
                 metrics: JobMetrics {
@@ -479,7 +593,19 @@ impl SecurityGateway {
         }
 
         if proc_res.exit_code != 0 {
-            let _ = quarantine_staging(staging_dir, quarantine_dir, &req.job_id);
+            let msg = if proc_res.stdout.is_empty() {
+                proc_res.stderr
+            } else {
+                proc_res.stdout
+            };
+            let mut diagnostics = vec![DiagnosticItem {
+                severity: "error".to_string(),
+                code: "WORKER_FAILED".to_string(),
+                message: msg,
+            }];
+            if let Err(cleanup_err) = quarantine_staging(staging_dir, quarantine_dir, &req.job_id) {
+                self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+            }
             let aid = self.record_audit(
                 req,
                 AuditDecision::Deny,
@@ -487,21 +613,12 @@ impl SecurityGateway {
                 None,
                 Some(-32001),
             )?;
-            let msg = if proc_res.stdout.is_empty() {
-                proc_res.stderr
-            } else {
-                proc_res.stdout
-            };
             return Ok(JobResponse {
                 schema_version: "1.0.0".to_string(),
                 job_id: req.job_id.clone(),
                 status: JobStatus::Failed,
                 output_refs: Vec::new(),
-                diagnostics: vec![DiagnosticItem {
-                    severity: "error".to_string(),
-                    code: "WORKER_FAILED".to_string(),
-                    message: msg,
-                }],
+                diagnostics,
                 source_revision: req.input_revision,
                 engine_version: "security-gateway-1.0.0".to_string(),
                 metrics: JobMetrics {
@@ -528,7 +645,16 @@ impl SecurityGateway {
         ) {
             Ok(v) => v,
             Err(exc) => {
-                let _ = quarantine_staging(staging_dir, quarantine_dir, &req.job_id);
+                let mut diagnostics = vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: exc.code().to_string(),
+                    message: exc.user_message().to_string(),
+                }];
+                if let Err(cleanup_err) =
+                    quarantine_staging(staging_dir, quarantine_dir, &req.job_id)
+                {
+                    self.handle_cleanup_failure(req, staging_dir, &cleanup_err, &mut diagnostics)?;
+                }
                 let aid = self.record_audit(
                     req,
                     AuditDecision::Quarantine,
@@ -541,11 +667,7 @@ impl SecurityGateway {
                     job_id: req.job_id.clone(),
                     status: JobStatus::Quarantined,
                     output_refs: Vec::new(),
-                    diagnostics: vec![DiagnosticItem {
-                        severity: "error".to_string(),
-                        code: exc.code().to_string(),
-                        message: exc.user_message().to_string(),
-                    }],
+                    diagnostics,
                     source_revision: req.input_revision,
                     engine_version: "security-gateway-1.0.0".to_string(),
                     metrics: JobMetrics {

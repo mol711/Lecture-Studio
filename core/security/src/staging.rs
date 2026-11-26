@@ -5,11 +5,34 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::errors::SecurityError;
 use crate::models::{DummyWorkerOutput, OutputRef};
+
+pub const STAGING_TAINT_MARKER: &str = ".lecture_studio_staging_tainted";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeReport {
+    pub quarantine_dir: PathBuf,
+    pub before_files: usize,
+    pub before_bytes: u64,
+    pub purged_files: usize,
+    pub purged_bytes: u64,
+    pub remaining_files: usize,
+    pub remaining_bytes: u64,
+    pub remaining_entries: usize,
+    pub failed_entries: Vec<PurgeFailure>,
+    pub tainted: bool,
+}
 
 #[cfg(windows)]
 fn is_reparse_or_link(meta: &fs::Metadata) -> bool {
@@ -72,33 +95,228 @@ pub fn validate_relative_staging_ref(staging_ref: &str) -> Result<PathBuf, Secur
 
 /// Measure current file count and total byte size inside `staging_root` without following links.
 pub fn measure_staging_usage(staging_root: &Path) -> Result<(usize, u64), SecurityError> {
-    if !staging_root.exists() {
-        return Ok((0, 0));
+    let (files, bytes, _, _) = measure_staging_strict(staging_root);
+    Ok((files, bytes))
+}
+
+fn sibling_taint_marker_path(staging_root: &Path) -> Option<PathBuf> {
+    let parent = staging_root.parent()?;
+    let name = staging_root.file_name()?.to_string_lossy();
+    Some(parent.join(format!(".{name}.tainted.json")))
+}
+
+/// Return `true` when a staging directory (or its sibling sentinel) is marked tainted.
+#[must_use]
+pub fn is_staging_tainted(staging_root: &Path) -> bool {
+    if staging_root.join(STAGING_TAINT_MARKER).exists() {
+        return true;
     }
+    sibling_taint_marker_path(staging_root).is_some_and(|p| p.exists())
+}
+
+/// Refuse reuse of any staging directory that is tainted, non-directory, or non-empty.
+pub fn ensure_clean_staging_dir(staging_root: &Path) -> Result<(), SecurityError> {
+    if is_staging_tainted(staging_root) {
+        return Err(SecurityError::StagingInspection {
+            code: "STAGING_TAINTED",
+            user_message:
+                "Staging directory is marked tainted after incomplete cleanup and cannot be reused."
+                    .to_string(),
+            detail: staging_root.display().to_string(),
+        });
+    }
+    match fs::symlink_metadata(staging_root) {
+        Ok(meta) => {
+            if is_reparse_or_link(&meta) || !meta.file_type().is_dir() {
+                return Err(SecurityError::StagingInspection {
+                    code: "STAGING_ROOT_INVALID",
+                    user_message: "Staging root must be a real directory, not a link or file."
+                        .to_string(),
+                    detail: staging_root.display().to_string(),
+                });
+            }
+            let mut entries =
+                fs::read_dir(staging_root).map_err(|e| SecurityError::StagingInspection {
+                    code: "STAGING_READ_ERROR",
+                    user_message: "Failed reading staging directory prior to job launch."
+                        .to_string(),
+                    detail: e.to_string(),
+                })?;
+            if let Some(first) = entries.next() {
+                let first_path = first
+                    .map(|ent| ent.path().display().to_string())
+                    .unwrap_or_else(|e| format!("<unreadable-entry: {e}>"));
+                return Err(SecurityError::StagingInspection {
+                    code: "STAGING_DIRTY",
+                    user_message:
+                        "Staging directory is not empty; refusing reuse of unreclaimed staging area."
+                            .to_string(),
+                    detail: first_path,
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SecurityError::StagingInspection {
+            code: "STAGING_READ_ERROR",
+            user_message: "Failed inspecting staging directory metadata.".to_string(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
+fn measure_staging_strict(staging_root: &Path) -> (usize, u64, usize, Vec<PurgeFailure>) {
+    match fs::symlink_metadata(staging_root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (0, 0, 0, Vec::new());
+        }
+        Err(e) => {
+            return (
+                0,
+                0,
+                1,
+                vec![PurgeFailure {
+                    path: staging_root.display().to_string(),
+                    error: e.to_string(),
+                }],
+            );
+        }
+        Ok(_) => {}
+    }
+
     let mut files = 0usize;
     let mut bytes = 0u64;
+    let mut total_entries = 0usize;
+    let mut errors = Vec::new();
     let mut stack = vec![staging_root.to_path_buf()];
+
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&p) else {
-                continue;
-            };
-            if is_reparse_or_link(&meta) {
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                total_entries = total_entries.saturating_add(1);
+                errors.push(PurgeFailure {
+                    path: dir.display().to_string(),
+                    error: e.to_string(),
+                });
                 continue;
             }
-            if meta.file_type().is_dir() {
-                stack.push(p);
-            } else if meta.file_type().is_file() {
-                files = files.saturating_add(1);
-                bytes = bytes.saturating_add(meta.len());
+        };
+        for entry_res in entries {
+            match entry_res {
+                Err(e) => {
+                    total_entries = total_entries.saturating_add(1);
+                    errors.push(PurgeFailure {
+                        path: dir.display().to_string(),
+                        error: e.to_string(),
+                    });
+                }
+                Ok(entry) => {
+                    let p = entry.path();
+                    if p.file_name().is_some_and(|n| n == STAGING_TAINT_MARKER) {
+                        continue;
+                    }
+                    total_entries = total_entries.saturating_add(1);
+                    match fs::symlink_metadata(&p) {
+                        Err(e) => errors.push(PurgeFailure {
+                            path: p.display().to_string(),
+                            error: e.to_string(),
+                        }),
+                        Ok(meta) => {
+                            if is_reparse_or_link(&meta) {
+                                continue;
+                            }
+                            if meta.file_type().is_dir() {
+                                stack.push(p);
+                            } else if meta.file_type().is_file() {
+                                files = files.saturating_add(1);
+                                bytes = bytes.saturating_add(meta.len());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    Ok((files, bytes))
+    (files, bytes, total_entries, errors)
+}
+
+fn write_taint_markers(staging_root: &Path, payload: &serde_json::Value) {
+    let serialized = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+    if staging_root.is_dir() {
+        let _ = fs::write(staging_root.join(STAGING_TAINT_MARKER), &serialized);
+    }
+    if let Some(sibling) = sibling_taint_marker_path(staging_root) {
+        if let Some(parent) = sibling.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(sibling, &serialized);
+    }
+}
+
+fn remove_dir_contents_strict(dir: &Path, failed: &mut Vec<PurgeFailure>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            failed.push(PurgeFailure {
+                path: dir.display().to_string(),
+                error: e.to_string(),
+            });
+            return;
+        }
+    };
+    for entry_res in entries {
+        let entry = match entry_res {
+            Ok(ent) => ent,
+            Err(e) => {
+                failed.push(PurgeFailure {
+                    path: dir.display().to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let p = entry.path();
+        if p.file_name().is_some_and(|n| n == STAGING_TAINT_MARKER) {
+            continue;
+        }
+        let meta = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) => {
+                failed.push(PurgeFailure {
+                    path: p.display().to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        if is_reparse_or_link(&meta) {
+            let res = if meta.file_type().is_dir() {
+                fs::remove_dir(&p)
+            } else {
+                fs::remove_file(&p)
+            };
+            if let Err(e) = res {
+                failed.push(PurgeFailure {
+                    path: p.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+        } else if meta.file_type().is_dir() {
+            remove_dir_contents_strict(&p, failed);
+            if let Err(e) = fs::remove_dir(&p) {
+                failed.push(PurgeFailure {
+                    path: p.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+        } else if let Err(e) = fs::remove_file(&p) {
+            failed.push(PurgeFailure {
+                path: p.display().to_string(),
+                error: e.to_string(),
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -367,13 +585,13 @@ impl StagingInspector {
     }
 }
 
-/// Purge oversized or resource-aborted staging contents immediately and store metadata-only record.
+/// Purge oversized or resource-aborted staging contents immediately, verify deletion, and record failures.
 pub fn purge_oversized_staging(
     staging_root: &Path,
     quarantine_root: &Path,
     job_id: &str,
     reason: &str,
-) -> Result<PathBuf, SecurityError> {
+) -> Result<PurgeReport, SecurityError> {
     let q_dir = quarantine_root.join(job_id);
     fs::create_dir_all(&q_dir).map_err(|e| SecurityError::StagingInspection {
         code: "QUARANTINE_FAILED",
@@ -381,39 +599,184 @@ pub fn purge_oversized_staging(
         detail: e.to_string(),
     })?;
 
-    let (file_count, total_bytes) = measure_staging_usage(staging_root)?;
+    let (before_files, before_bytes, _, mut failed_entries) = measure_staging_strict(staging_root);
     if staging_root.exists() {
-        if let Ok(entries) = fs::read_dir(staging_root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Ok(meta) = fs::symlink_metadata(&p) {
-                    if is_reparse_or_link(&meta) {
-                        if meta.file_type().is_dir() {
-                            let _ = fs::remove_dir(&p);
-                        } else {
-                            let _ = fs::remove_file(&p);
+        remove_dir_contents_strict(staging_root, &mut failed_entries);
+    }
+    let (remaining_files, remaining_bytes, remaining_entries, post_errors) =
+        measure_staging_strict(staging_root);
+    failed_entries.extend(post_errors);
+
+    let purged_files = before_files.saturating_sub(remaining_files);
+    let purged_bytes = before_bytes.saturating_sub(remaining_bytes);
+    let tainted = !failed_entries.is_empty()
+        || remaining_files > 0
+        || remaining_bytes > 0
+        || remaining_entries > 0;
+    let status = if tainted {
+        "purge_incomplete_tainted"
+    } else {
+        "reclaimed"
+    };
+
+    let report_json = json!({
+        "job_id": job_id,
+        "reason": reason,
+        "status": status,
+        "before_files": before_files,
+        "before_bytes": before_bytes,
+        "purged_files": purged_files,
+        "purged_bytes": purged_bytes,
+        "remaining_files": remaining_files,
+        "remaining_bytes": remaining_bytes,
+        "remaining_entries": remaining_entries,
+        "failed_entries": &failed_entries,
+        "tainted": tainted,
+    });
+
+    fs::write(
+        q_dir.join("resource_limit_quarantine.json"),
+        serde_json::to_string_pretty(&report_json).unwrap_or_else(|_| report_json.to_string()),
+    )
+    .map_err(|e| SecurityError::StagingInspection {
+        code: "QUARANTINE_FAILED",
+        user_message: "Failed recording staging purge report in quarantine.".to_string(),
+        detail: e.to_string(),
+    })?;
+
+    if tainted {
+        write_taint_markers(staging_root, &report_json);
+        return Err(SecurityError::StagingInspection {
+            code: "STAGING_PURGE_FAILED",
+            user_message:
+                "Failed to reclaim all staging contents; remaining bytes recorded and staging marked tainted."
+                    .to_string(),
+            detail: format!(
+                "remaining_files={remaining_files} remaining_bytes={remaining_bytes} remaining_entries={remaining_entries} failures={}",
+                failed_entries.len()
+            ),
+        });
+    }
+
+    Ok(PurgeReport {
+        quarantine_dir: q_dir,
+        before_files,
+        before_bytes,
+        purged_files,
+        purged_bytes,
+        remaining_files,
+        remaining_bytes,
+        remaining_entries,
+        failed_entries,
+        tainted: false,
+    })
+}
+
+fn quarantine_dir_recursive(src_dir: &Path, dst_dir: &Path, failed: &mut Vec<PurgeFailure>) {
+    let entries = match fs::read_dir(src_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            failed.push(PurgeFailure {
+                path: src_dir.display().to_string(),
+                error: e.to_string(),
+            });
+            return;
+        }
+    };
+    for entry_res in entries {
+        let entry = match entry_res {
+            Ok(ent) => ent,
+            Err(e) => {
+                failed.push(PurgeFailure {
+                    path: src_dir.display().to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == STAGING_TAINT_MARKER) {
+            continue;
+        }
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                failed.push(PurgeFailure {
+                    path: path.display().to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if is_reparse_or_link(&meta) {
+            let target = fs::read_link(&path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unreadable-reparse>".to_string());
+            let meta_path = dst_dir.join(format!("{fname}.link_meta.json"));
+            if let Err(e) = fs::write(
+                &meta_path,
+                json!({ "name": fname, "link_target": target }).to_string(),
+            ) {
+                failed.push(PurgeFailure {
+                    path: meta_path.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+            let rm_res = if meta.file_type().is_dir() {
+                fs::remove_dir(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(e) = rm_res {
+                failed.push(PurgeFailure {
+                    path: path.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+        } else if meta.file_type().is_dir() {
+            let sub_dst = dst_dir.join(&fname);
+            if let Err(e) = fs::create_dir_all(&sub_dst) {
+                failed.push(PurgeFailure {
+                    path: sub_dst.display().to_string(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+            quarantine_dir_recursive(&path, &sub_dst, failed);
+            if let Err(e) = fs::remove_dir(&path) {
+                failed.push(PurgeFailure {
+                    path: path.display().to_string(),
+                    error: e.to_string(),
+                });
+            }
+        } else if meta.file_type().is_file() {
+            let dst = dst_dir.join(&fname);
+            if let Err(rename_err) = fs::rename(&path, &dst) {
+                match fs::copy(&path, &dst) {
+                    Ok(_) => {
+                        if let Err(rm_err) = fs::remove_file(&path) {
+                            failed.push(PurgeFailure {
+                                path: path.display().to_string(),
+                                error: rm_err.to_string(),
+                            });
                         }
-                    } else if meta.file_type().is_dir() {
-                        let _ = fs::remove_dir_all(&p);
-                    } else {
-                        let _ = fs::remove_file(&p);
+                    }
+                    Err(copy_err) => {
+                        failed.push(PurgeFailure {
+                            path: path.display().to_string(),
+                            error: format!("rename={rename_err}; copy={copy_err}"),
+                        });
                     }
                 }
             }
+        } else if let Err(e) = fs::remove_file(&path) {
+            failed.push(PurgeFailure {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            });
         }
     }
-
-    let _ = fs::write(
-        q_dir.join("resource_limit_quarantine.json"),
-        json!({
-            "job_id": job_id,
-            "reason": reason,
-            "purged_files": file_count,
-            "purged_bytes": total_bytes,
-        })
-        .to_string(),
-    );
-    Ok(q_dir)
 }
 
 pub fn quarantine_staging(
@@ -431,37 +794,43 @@ pub fn quarantine_staging(
         return Ok(q_dir);
     }
 
-    let Ok(entries) = fs::read_dir(staging_root) else {
-        return Ok(q_dir);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let fname = entry.file_name().to_string_lossy().into_owned();
-        if is_reparse_or_link(&meta) {
-            let target = fs::read_link(&path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<unreadable-reparse>".to_string());
-            let meta_path = q_dir.join(format!("{fname}.link_meta.json"));
-            let _ = fs::write(
-                meta_path,
-                json!({ "name": fname, "link_target": target }).to_string(),
-            );
-            if meta.file_type().is_dir() {
-                let _ = fs::remove_dir(&path);
-            } else {
-                let _ = fs::remove_file(&path);
-            }
-        } else if meta.file_type().is_file() {
-            let dst = q_dir.join(&fname);
-            if fs::rename(&path, &dst).is_err() {
-                let _ = fs::copy(&path, &dst);
-                let _ = fs::remove_file(&path);
-            }
-        }
+    let mut failed_entries = Vec::new();
+    quarantine_dir_recursive(staging_root, &q_dir, &mut failed_entries);
+    let (remaining_files, remaining_bytes, remaining_entries, post_errors) =
+        measure_staging_strict(staging_root);
+    failed_entries.extend(post_errors);
+
+    if !failed_entries.is_empty()
+        || remaining_files > 0
+        || remaining_bytes > 0
+        || remaining_entries > 0
+    {
+        let report_json = json!({
+            "job_id": job_id,
+            "status": "quarantine_incomplete_tainted",
+            "remaining_files": remaining_files,
+            "remaining_bytes": remaining_bytes,
+            "remaining_entries": remaining_entries,
+            "failed_entries": &failed_entries,
+            "tainted": true,
+        });
+        let _ = fs::write(
+            q_dir.join("quarantine_incomplete.json"),
+            serde_json::to_string_pretty(&report_json).unwrap_or_else(|_| report_json.to_string()),
+        );
+        write_taint_markers(staging_root, &report_json);
+        return Err(SecurityError::StagingInspection {
+            code: "STAGING_QUARANTINE_FAILED",
+            user_message:
+                "Failed to quarantine all staging contents; staging directory marked tainted."
+                    .to_string(),
+            detail: format!(
+                "remaining_files={remaining_files} remaining_bytes={remaining_bytes} remaining_entries={remaining_entries} failures={}",
+                failed_entries.len()
+            ),
+        });
     }
+
     Ok(q_dir)
 }
 

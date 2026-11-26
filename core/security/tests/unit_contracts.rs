@@ -10,8 +10,8 @@ use lecture_studio_security::sandbox::{
     create_sandbox_backend, list_backend_availability, seccomp_bpf,
 };
 use lecture_studio_security::staging::{
-    atomic_promote, measure_staging_usage, purge_oversized_staging, quarantine_staging,
-    validate_relative_staging_ref, StagingInspector,
+    atomic_promote, is_staging_tainted, measure_staging_usage, purge_oversized_staging,
+    quarantine_staging, validate_relative_staging_ref, StagingInspector,
 };
 use lecture_studio_security::{
     Actor, AuditDecision, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest,
@@ -369,7 +369,12 @@ fn staging_containment_rejects_traversal_absolute_drive_ads_and_oversized() {
         .unwrap_err();
     assert_eq!(err_sz.code(), "SIZE_LIMIT_EXCEEDED");
 
-    purge_oversized_staging(&staging, &quarantine, "job-c", "SIZE_LIMIT_EXCEEDED").unwrap();
+    let purge_report =
+        purge_oversized_staging(&staging, &quarantine, "job-c", "SIZE_LIMIT_EXCEEDED").unwrap();
+    assert_eq!(purge_report.purged_files, 2);
+    assert!(!purge_report.tainted);
+    assert_eq!(purge_report.remaining_files, 0);
+    assert_eq!(purge_report.remaining_bytes, 0);
     let (files_after, bytes_after) = measure_staging_usage(&staging).unwrap();
     assert_eq!(files_after, 0);
     assert_eq!(bytes_after, 0);
@@ -502,4 +507,140 @@ fn backend_switching_never_falls_back_to_unsandboxed_and_idempotency_holds() {
     assert_eq!(r2.diagnostics[0].code, "DUPLICATE_REQUEST");
     assert!(!official.exists());
     let _: fn(&SecurityError) -> i32 = SecurityError::jsonrpc_code;
+}
+
+#[test]
+fn staging_purge_failure_records_remaining_bytes_and_blocks_reuse() {
+    let tmp = TempDir::new().unwrap();
+    let staging = tmp.path().join("staging_tainted");
+    let quarantine = tmp.path().join("quarantine");
+    let in_dir = tmp.path().join("in");
+    let official = tmp.path().join("official").join("out.json");
+    fs::create_dir_all(&staging).unwrap();
+    fs::create_dir_all(&in_dir).unwrap();
+    let unused_worker = tmp.path().join("unused_worker.py");
+    fs::write(&unused_worker, "").unwrap();
+
+    let deletable = staging.join("deletable.bin");
+    fs::write(&deletable, vec![b'A'; 256]).unwrap();
+
+    #[cfg(windows)]
+    let (locked_path, locked_guard) = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let p = staging.join("locked.bin");
+        fs::write(&p, vec![b'B'; 1024]).unwrap();
+        // Hold exclusive handle (share_mode=0) so remove_file fails with sharing violation.
+        let fh = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&p)
+            .unwrap();
+        (p, Some(fh))
+    };
+
+    #[cfg(unix)]
+    let (locked_path, locked_dir) = {
+        use std::os::unix::fs::PermissionsExt;
+        let sub = staging.join("locked_sub");
+        fs::create_dir_all(&sub).unwrap();
+        let p = sub.join("locked.bin");
+        fs::write(&p, vec![b'B'; 1024]).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        (p, sub)
+    };
+
+    let err = purge_oversized_staging(
+        &staging,
+        &quarantine,
+        "job-purge-fail",
+        "DISK_LIMIT_EXCEEDED",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "STAGING_PURGE_FAILED");
+    assert_eq!(err.jsonrpc_code(), -32003);
+
+    let report_path = quarantine
+        .join("job-purge-fail")
+        .join("resource_limit_quarantine.json");
+    let report: Value = serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["tainted"], json!(true));
+    assert_eq!(report["status"], json!("purge_incomplete_tainted"));
+    assert_eq!(report["before_bytes"], json!(1280));
+    assert_eq!(report["purged_bytes"], json!(256));
+    assert_eq!(report["remaining_bytes"], json!(1024));
+    assert_eq!(report["remaining_files"], json!(1));
+    let failures = report["failed_entries"].as_array().unwrap();
+    assert!(!failures.is_empty());
+    assert!(failures
+        .iter()
+        .any(|f| f["path"].as_str().unwrap_or("").contains("locked")));
+    assert!(is_staging_tainted(&staging));
+    assert!(!deletable.exists());
+    assert!(locked_path.exists());
+
+    // Even a fresh SecurityGateway must refuse reusing the tainted staging directory BEFORE launch.
+    let audit_path = tmp.path().join("audit.jsonl");
+    let mut fresh_gw = SecurityGateway::new(
+        PolicyEngine::default(),
+        HashChainedAuditLog::new(&audit_path, true),
+        SandboxMode::Auto,
+        "Ubuntu",
+        true,
+    );
+    let reuse_req = base_job_request(Actor::CliUser, Actor::CliUser);
+    let reuse_resp = fresh_gw
+        .execute_dummy_job(
+            &reuse_req,
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &staging,
+                official_output_file: &official,
+                quarantine_dir: &quarantine,
+                worker_script: &unused_worker,
+                worker_args: &[],
+            },
+        )
+        .unwrap();
+    assert_eq!(reuse_resp.status, JobStatus::Failed);
+    assert_eq!(reuse_resp.error_code, Some(-32003));
+    assert_eq!(reuse_resp.diagnostics[0].code, "STAGING_TAINTED");
+    assert_eq!(reuse_resp.metrics.exit_code, None);
+    assert!(!official.exists());
+
+    // A non-empty untainted staging directory must also be refused before launch (STAGING_DIRTY).
+    let dirty_staging = tmp.path().join("staging_dirty");
+    fs::create_dir_all(&dirty_staging).unwrap();
+    fs::write(dirty_staging.join("leftover.txt"), b"leftover").unwrap();
+    let mut dirty_req = base_job_request(Actor::CliUser, Actor::CliUser);
+    dirty_req.request_id = "req-dirty".to_string();
+    dirty_req.job_id = "job-dirty".to_string();
+    let dirty_resp = fresh_gw
+        .execute_dummy_job(
+            &dirty_req,
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &dirty_staging,
+                official_output_file: &official,
+                quarantine_dir: &quarantine,
+                worker_script: &unused_worker,
+                worker_args: &[],
+            },
+        )
+        .unwrap();
+    assert_eq!(dirty_resp.status, JobStatus::Failed);
+    assert_eq!(dirty_resp.error_code, Some(-32003));
+    assert_eq!(dirty_resp.diagnostics[0].code, "STAGING_DIRTY");
+
+    #[cfg(windows)]
+    drop(locked_guard);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+    }
 }

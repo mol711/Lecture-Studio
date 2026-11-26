@@ -64,6 +64,8 @@ mod imp {
                 "bwrap",
                 "systemd-run",
                 "python3",
+                "unshare",
+                "mount",
             ])
             .output()
         else {

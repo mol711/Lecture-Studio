@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use lecture_studio_security::sandbox::windows_appcontainer::WINDOWS_STAGING_VOLUME_ENV;
 use lecture_studio_security::sandbox::{create_sandbox_backend, SandboxedProcessSpec};
 use lecture_studio_security::staging::measure_staging_usage;
 use lecture_studio_security::{
@@ -111,8 +112,93 @@ fn make_req(job_id: &str, req_id: &str, input_hash: &str, staging_ref: &str) -> 
 }
 
 #[test]
-fn windows_appcontainer_security_boundaries_sec01_to_sec06() {
+fn windows_appcontainer_refuses_unbounded_staging_volume_before_worker_launch() {
     let tmp = TempDir::new().unwrap();
+    let in_dir = tmp.path().join("in");
+    let official_dir = tmp.path().join("official");
+    let quarantine_dir = tmp.path().join("quarantine");
+    let audit_path = tmp.path().join("audit").join("win_audit.jsonl");
+    for d in [&in_dir, &official_dir, &quarantine_dir] {
+        fs::create_dir_all(d).unwrap();
+    }
+
+    let in_bytes = br#"{"title":"Synthetic Windows Precheck"}"#;
+    fs::write(in_dir.join("lecture_sample.json"), in_bytes).unwrap();
+    let in_hash = hex::encode(Sha256::digest(in_bytes));
+    let worker = dummy_worker_path();
+
+    // Direct backend invocation on host unbounded drive must fail before creating staging_dir
+    let st_direct = tmp.path().join("unbounded_direct_staging");
+    let backend = create_sandbox_backend(SandboxMode::WindowsAppcontainer, "Ubuntu").unwrap();
+    let direct_err = backend
+        .run(&SandboxedProcessSpec {
+            job_id: "win-unbounded-direct".into(),
+            worker_script: worker.clone(),
+            input_dir: in_dir.clone(),
+            staging_dir: st_direct.clone(),
+            worker_args: vec!["--mode".into(), "benign".into()],
+            limits: ResourceLimits::default(),
+        })
+        .unwrap_err();
+    assert_eq!(direct_err.code(), "HARD_DISK_QUOTA_UNAVAILABLE");
+    assert_eq!(direct_err.jsonrpc_code(), -32002);
+    assert!(
+        !st_direct.exists(),
+        "staging_dir must not even be created when volume precheck fails"
+    );
+
+    // Gateway invocation must reject fail-closed before launching any worker
+    let mut gw = SecurityGateway::new(
+        PolicyEngine::default(),
+        HashChainedAuditLog::new(&audit_path, true),
+        SandboxMode::WindowsAppcontainer,
+        "Ubuntu",
+        true,
+    );
+    let st_gw = tmp.path().join("unbounded_gw_staging");
+    let official_out = official_dir.join("should_not_exist.json");
+    let resp = gw
+        .execute_dummy_job(
+            &make_req(
+                "job-win-unbounded",
+                "req-win-unbounded",
+                &in_hash,
+                "out.json",
+            ),
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_gw,
+                official_output_file: &official_out,
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[],
+            },
+        )
+        .unwrap();
+    assert_eq!(resp.status, JobStatus::Failed);
+    assert_eq!(resp.error_code, Some(-32002));
+    assert_eq!(resp.diagnostics[0].code, "HARD_DISK_QUOTA_UNAVAILABLE");
+    assert_eq!(resp.metrics.exit_code, None);
+    assert!(!st_gw.exists());
+    assert!(!official_out.exists());
+
+    let (ok, count, reason) = HashChainedAuditLog::new(&audit_path, true)
+        .verify_chain()
+        .unwrap();
+    assert!(ok, "audit chain failed: {reason}");
+    assert_eq!(count, 1);
+}
+
+#[test]
+#[ignore = "Windows native full boundary requires pre-mounted capacity-bounded staging volume via LECTURE_STUDIO_WINDOWS_STAGING_VOLUME (status: 未完了 per ADR-0003)"]
+fn windows_appcontainer_security_boundaries_sec01_to_sec06() {
+    let bounded_root = PathBuf::from(
+        std::env::var(WINDOWS_STAGING_VOLUME_ENV)
+            .expect("Set LECTURE_STUDIO_WINDOWS_STAGING_VOLUME to a pre-mounted bounded volume"),
+    );
+    let tmp = TempDir::new_in(&bounded_root).unwrap();
     let in_dir = tmp.path().join("in");
     let secret_dir = tmp.path().join("secret");
     let outside_dir = tmp.path().join("outside");

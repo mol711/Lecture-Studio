@@ -83,8 +83,8 @@ pub fn create_sandbox_backend(
         SandboxMode::Auto => {
             let candidates: Vec<Box<dyn SandboxBackend>> = vec![
                 Box::new(linux_bwrap::LinuxBwrapCgroupBackend),
-                Box::new(windows_appcontainer::WindowsAppContainerJobBackend),
                 Box::new(wsl_bridge::WslLinuxBwrapBackend::new(wsl_distro)),
+                Box::new(windows_appcontainer::WindowsAppContainerJobBackend),
             ];
             for c in candidates {
                 if c.is_available() {

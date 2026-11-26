@@ -253,16 +253,14 @@ def mode_resource_disk_single(output_path: pathlib.Path) -> int:
     written = 0
     try:
         with output_path.open("wb") as fh:
-            for _ in range(128):  # up to 8 MiB
+            for _ in range(128):  # up to 8 MiB without sleep
                 fh.write(chunk)
                 fh.flush()
-                os.fsync(fh.fileno())
                 written += len(chunk)
-                time.sleep(0.005)
         print(f"DISK_SINGLE_COMPLETED={written}")
         return 0
     except OSError as exc:
-        print(f"BLOCKED_DISK_WRITE:written={written}:{type(exc).__name__}:{exc}")
+        print(f"BLOCKED_DISK_WRITE:written={written}:errno={exc.errno}:{type(exc).__name__}:{exc}")
         return 1
 
 
@@ -281,7 +279,43 @@ def mode_resource_disk_spray(output_dir: pathlib.Path) -> int:
         print(f"DISK_SPRAY_COMPLETED={files_written}")
         return 0
     except OSError as exc:
-        print(f"BLOCKED_DISK_SPRAY:files={files_written}:{type(exc).__name__}:{exc}")
+        print(f"BLOCKED_DISK_SPRAY:files={files_written}:errno={exc.errno}:{type(exc).__name__}:{exc}")
+        return 1
+
+
+def mode_resource_disk_spray_fast(output_dir: pathlib.Path) -> int:
+    chunk = b"F" * (64 * 1024)
+    files_written = 0
+    bytes_written = 0
+    try:
+        for idx in range(64):  # 64 * 64 KiB = 4 MiB with zero sleep
+            p = output_dir / f"fast_{idx:02d}.bin"
+            with p.open("wb") as fh:
+                fh.write(chunk)
+            files_written += 1
+            bytes_written += len(chunk)
+        print(f"DISK_SPRAY_FAST_COMPLETED={files_written}")
+        return 0
+    except OSError as exc:
+        print(
+            f"BLOCKED_DISK_SPRAY_FAST:files={files_written}:bytes={bytes_written}:"
+            f"errno={exc.errno}:{type(exc).__name__}:{exc}"
+        )
+        return 1
+
+
+def mode_resource_disk_inodes(output_dir: pathlib.Path) -> int:
+    files_written = 0
+    try:
+        for idx in range(64):  # exceed 32 file inode cap with zero sleep
+            p = output_dir / f"inode_{idx:02d}.txt"
+            with p.open("wb") as fh:
+                fh.write(b"inode-test\n")
+            files_written += 1
+        print(f"DISK_INODES_COMPLETED={files_written}")
+        return 0
+    except OSError as exc:
+        print(f"BLOCKED_DISK_INODES:files={files_written}:errno={exc.errno}:{type(exc).__name__}:{exc}")
         return 1
 
 
@@ -358,6 +392,10 @@ def main() -> int:
         return mode_resource_disk_single(args.output)
     if m == "resource_disk_spray":
         return mode_resource_disk_spray(args.output)
+    if m == "resource_disk_spray_fast":
+        return mode_resource_disk_spray_fast(args.output)
+    if m == "resource_disk_inodes":
+        return mode_resource_disk_inodes(args.output)
     if m == "resource_disk_tmp":
         return mode_resource_disk_tmp()
 
