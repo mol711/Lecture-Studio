@@ -13,13 +13,15 @@ mod imp {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
     use uuid::Uuid;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, HANDLE, HANDLE_FLAG_INHERIT, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, LocalFree, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{
@@ -27,12 +29,13 @@ mod imp {
     };
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
-        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAndIoAccountingInformation,
+        JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+        JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
@@ -45,6 +48,7 @@ mod imp {
 
     use crate::errors::SecurityError;
     use crate::sandbox::{IsolatedProcessResult, SandboxedProcessSpec};
+    use crate::staging::measure_staging_usage;
 
     #[link(name = "userenv")]
     extern "system" {
@@ -230,7 +234,11 @@ mod imp {
         out
     }
 
-    fn drain_pipe_raw(handle_addr: usize) -> String {
+    fn drain_pipe_bounded(
+        handle_addr: usize,
+        max_bytes: usize,
+        overflow: Arc<AtomicBool>,
+    ) -> String {
         let h = handle_addr as HANDLE;
         let mut collected = Vec::new();
         let mut buf = [0u8; 4096];
@@ -249,7 +257,14 @@ mod imp {
             if ok == 0 || read_n == 0 {
                 break;
             }
-            collected.extend_from_slice(&buf[..read_n as usize]);
+            let n = read_n as usize;
+            let remaining = max_bytes.saturating_sub(collected.len());
+            let take = n.min(remaining);
+            collected.extend_from_slice(&buf[..take]);
+            if n > remaining {
+                overflow.store(true, Ordering::SeqCst);
+                break;
+            }
         }
         String::from_utf8_lossy(&collected).trim().to_string()
     }
@@ -569,20 +584,72 @@ mod imp {
             ResumeThread(pi.hThread);
         }
 
+        let max_stdio = usize::try_from(spec.limits.max_stdio_bytes).unwrap_or(256 * 1024);
+        let stdio_overflow = Arc::new(AtomicBool::new(false));
         let r_out_addr = r_out_guard.0 as usize;
         let r_err_addr = r_err_guard.0 as usize;
-        let out_thread = thread::spawn(move || drain_pipe_raw(r_out_addr));
-        let err_thread = thread::spawn(move || drain_pipe_raw(r_err_addr));
+        let out_ov = Arc::clone(&stdio_overflow);
+        let err_ov = Arc::clone(&stdio_overflow);
+        let out_thread = thread::spawn(move || drain_pipe_bounded(r_out_addr, max_stdio, out_ov));
+        let err_thread = thread::spawn(move || drain_pipe_bounded(r_err_addr, max_stdio, err_ov));
 
-        let wait_ms = u32::try_from(spec.limits.timeout_ms).unwrap_or(u32::MAX - 1);
-        // SAFETY: waiting on child process handle up to `wait_ms`.
-        let wait_res = unsafe { WaitForSingleObject(pi.hProcess, wait_ms) };
-        let timed_out = wait_res == WAIT_TIMEOUT;
-        if timed_out {
-            // SAFETY: terminate entire Job Object tree on timeout.
-            unsafe {
-                TerminateJobObject(job_handle, 0xDEAD);
-                WaitForSingleObject(pi.hProcess, 3000);
+        let timeout = Duration::from_millis(spec.limits.timeout_ms);
+        let io_write_cap = spec
+            .limits
+            .max_output_bytes
+            .saturating_add(spec.limits.max_stdio_bytes)
+            .saturating_add(512 * 1024);
+        let mut timed_out = false;
+        let mut stdio_limit_exceeded = false;
+        let mut disk_limit_exceeded = false;
+
+        loop {
+            // SAFETY: polling child process handle for up to 20ms.
+            let wait_res = unsafe { WaitForSingleObject(pi.hProcess, 20) };
+            if wait_res == WAIT_OBJECT_0 {
+                break;
+            }
+            if stdio_overflow.load(Ordering::SeqCst) {
+                stdio_limit_exceeded = true;
+                // SAFETY: terminate Job Object on stdio overflow.
+                unsafe {
+                    TerminateJobObject(job_handle, 0xE001);
+                    WaitForSingleObject(pi.hProcess, 3000);
+                }
+                break;
+            }
+            let staging_exceeded = measure_staging_usage(&spec.staging_dir)
+                .is_ok_and(|(files, bytes)| files > 32 || bytes > spec.limits.max_output_bytes);
+            let mut acct: JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION =
+                // SAFETY: zero-initialized Win32 accounting struct.
+                unsafe { std::mem::zeroed() };
+            let io_exceeded = unsafe {
+                QueryInformationJobObject(
+                    job_handle,
+                    JobObjectBasicAndIoAccountingInformation,
+                    (&raw mut acct).cast::<c_void>(),
+                    std::mem::size_of::<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                ) != 0
+                    && acct.IoInfo.WriteTransferCount > io_write_cap
+            };
+            if staging_exceeded || io_exceeded {
+                disk_limit_exceeded = true;
+                // SAFETY: terminate Job Object on runtime disk/write cap violation.
+                unsafe {
+                    TerminateJobObject(job_handle, 0xE002);
+                    WaitForSingleObject(pi.hProcess, 3000);
+                }
+                break;
+            }
+            if t0.elapsed() >= timeout {
+                timed_out = true;
+                // SAFETY: terminate entire Job Object tree on timeout.
+                unsafe {
+                    TerminateJobObject(job_handle, 0xDEAD);
+                    WaitForSingleObject(pi.hProcess, 3000);
+                }
+                break;
             }
         }
 
@@ -597,6 +664,16 @@ mod imp {
 
         let stdout = out_thread.join().unwrap_or_default();
         let stderr = err_thread.join().unwrap_or_default();
+        if stdio_overflow.load(Ordering::SeqCst) {
+            stdio_limit_exceeded = true;
+        }
+        if !stdio_limit_exceeded
+            && !timed_out
+            && measure_staging_usage(&spec.staging_dir)
+                .is_ok_and(|(files, bytes)| files > 32 || bytes > spec.limits.max_output_bytes)
+        {
+            disk_limit_exceeded = true;
+        }
         let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         drop(r_out_guard);
@@ -607,6 +684,8 @@ mod imp {
             backend_name: "windows_appcontainer".to_string(),
             exit_code: exit_code as i32,
             timed_out,
+            stdio_limit_exceeded,
+            disk_limit_exceeded,
             stdout,
             stderr,
             duration_ms,

@@ -47,10 +47,19 @@ def test_job_request_and_ipc_schema_reject_network_or_unknown_method() -> None:
             "cpu_quota_percent": 50,
             "timeout_ms": 15000,
             "max_output_bytes": 1048576,
+            "max_stdio_bytes": 262144,
             "allow_network": False,
         },
     }
     jsonschema.validate(instance=valid_req, schema=req_schema)
+
+    bad_stdio = json.loads(json.dumps(valid_req))
+    bad_stdio["resource_limits"]["max_stdio_bytes"] = 128
+    try:
+        jsonschema.validate(instance=bad_stdio, schema=req_schema)
+        raise AssertionError("max_stdio_bytes < 1024 must fail schema validation")
+    except jsonschema.ValidationError:
+        pass
 
     bad_net = json.loads(json.dumps(valid_req))
     bad_net["resource_limits"]["allow_network"] = True

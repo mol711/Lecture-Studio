@@ -233,6 +233,75 @@ def mode_check_seccomp(output_path: pathlib.Path, job_id: str, expected_rev: int
     return 0
 
 
+def mode_resource_stdio_flood() -> int:
+    chunk = "A" * 32768 + "\n"
+    written = 0
+    try:
+        for _ in range(128):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            written += len(chunk)
+            time.sleep(0.005)
+        print(f"STDIO_COMPLETED={written}")
+        return 0
+    except BrokenPipeError:
+        return 1
+
+
+def mode_resource_disk_single(output_path: pathlib.Path) -> int:
+    chunk = b"D" * (64 * 1024)
+    written = 0
+    try:
+        with output_path.open("wb") as fh:
+            for _ in range(128):  # up to 8 MiB
+                fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
+                written += len(chunk)
+                time.sleep(0.005)
+        print(f"DISK_SINGLE_COMPLETED={written}")
+        return 0
+    except OSError as exc:
+        print(f"BLOCKED_DISK_WRITE:written={written}:{type(exc).__name__}:{exc}")
+        return 1
+
+
+def mode_resource_disk_spray(output_dir: pathlib.Path) -> int:
+    chunk = b"S" * (64 * 1024)
+    files_written = 0
+    try:
+        for idx in range(40):  # 40 * 64 KiB = 2.5 MiB
+            p = output_dir / f"spray_{idx:02d}.bin"
+            with p.open("wb") as fh:
+                fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
+            files_written += 1
+            time.sleep(0.01)
+        print(f"DISK_SPRAY_COMPLETED={files_written}")
+        return 0
+    except OSError as exc:
+        print(f"BLOCKED_DISK_SPRAY:files={files_written}:{type(exc).__name__}:{exc}")
+        return 1
+
+
+def mode_resource_disk_tmp() -> int:
+    chunk = b"T" * (64 * 1024)
+    written = 0
+    target = pathlib.Path("/tmp/ls_tmp_flood.bin")
+    try:
+        with target.open("wb") as fh:
+            for _ in range(64):  # 4 MiB
+                fh.write(chunk)
+                fh.flush()
+                written += len(chunk)
+        print(f"TMP_WRITE_COMPLETED={written}")
+        return 0
+    except OSError as exc:
+        print(f"BLOCKED_TMP_WRITE:written={written}:{type(exc).__name__}:{exc}")
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Lecture-Studio Phase 1 isolated dummy worker")
     parser.add_argument("--mode", required=True)
@@ -283,6 +352,14 @@ def main() -> int:
         return mode_tamper_symlink_output(args.output, args.secret)
     if m == "check_seccomp":
         return mode_check_seccomp(args.output, args.job_id, args.revision, args.input_hash)
+    if m == "resource_stdio_flood":
+        return mode_resource_stdio_flood()
+    if m == "resource_disk_single":
+        return mode_resource_disk_single(args.output)
+    if m == "resource_disk_spray":
+        return mode_resource_disk_spray(args.output)
+    if m == "resource_disk_tmp":
+        return mode_resource_disk_tmp()
 
     print(f"UNKNOWN_MODE:{m}", file=sys.stderr)
     return 2

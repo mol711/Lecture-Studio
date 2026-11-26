@@ -9,7 +9,10 @@ use lecture_studio_security::ipc::{
 use lecture_studio_security::sandbox::{
     create_sandbox_backend, list_backend_availability, seccomp_bpf,
 };
-use lecture_studio_security::staging::{atomic_promote, quarantine_staging, StagingInspector};
+use lecture_studio_security::staging::{
+    atomic_promote, measure_staging_usage, purge_oversized_staging, quarantine_staging,
+    validate_relative_staging_ref, StagingInspector,
+};
 use lecture_studio_security::{
     Actor, AuditDecision, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest,
     JobStatus, Operation, PolicyEngine, Purpose, ResourceLimits, SandboxMode, SecurityError,
@@ -265,7 +268,7 @@ fn staging_inspector_quarantine_and_atomic_promote() {
 
     let inspector = StagingInspector::default();
     let (raw, oref) = inspector
-        .validate_dummy_output(&staging, &out_file, "job-1", 1, &h)
+        .validate_dummy_output(&staging, "out.json", "job-1", 1, &h)
         .unwrap();
     assert_eq!(oref.size_bytes as usize, raw.len());
     atomic_promote(&raw, &official).unwrap();
@@ -284,11 +287,130 @@ fn staging_inspector_quarantine_and_atomic_promote() {
     let bad_file = staging.join("bad.json");
     fs::write(&bad_file, bad_rev.to_string()).unwrap();
     let err = inspector
-        .validate_dummy_output(&staging, &bad_file, "job-1", 1, &h)
+        .validate_dummy_output(&staging, "bad.json", "job-1", 1, &h)
         .unwrap_err();
     assert_eq!(err.code(), "REVISION_MISMATCH");
     let q_dir = quarantine_staging(&staging, &quarantine, "job-1").unwrap();
     assert!(q_dir.join("bad.json").exists());
+}
+
+#[test]
+fn staging_containment_rejects_traversal_absolute_drive_ads_and_oversized() {
+    let tmp = TempDir::new().unwrap();
+    let staging = tmp.path().join("staging");
+    let quarantine = tmp.path().join("quarantine");
+    let official = tmp.path().join("official").join("out.json");
+    fs::create_dir_all(staging.join("sub")).unwrap();
+
+    // Disallowed staging_output_ref patterns
+    for bad_ref in [
+        "",
+        "../outside.json",
+        "sub/../../outside.json",
+        "/etc/passwd",
+        r"\Windows\System32\drivers\etc\hosts",
+        r"C:\temp\out.json",
+        "out.json:ads_stream",
+        "./out.json",
+    ] {
+        let err = validate_relative_staging_ref(bad_ref).unwrap_err();
+        assert_eq!(
+            err.code(),
+            "PATH_ESCAPE",
+            "expected PATH_ESCAPE for {bad_ref}"
+        );
+        assert_eq!(err.jsonrpc_code(), -32003);
+    }
+
+    // Valid nested relative ref is accepted
+    assert!(validate_relative_staging_ref("sub/out.json").is_ok());
+
+    let h = sample_hash();
+    let valid_doc = json!({
+        "schema_version": "1.0.0",
+        "job_id": "job-c",
+        "input_revision": 1,
+        "input_hash": h,
+        "worker_pid": 9,
+        "echo_title": "Outside",
+        "status": "ok"
+    });
+    // Place valid JSON outside staging root
+    let outside_json = tmp.path().join("outside.json");
+    fs::write(&outside_json, valid_doc.to_string()).unwrap();
+
+    let inspector = StagingInspector {
+        max_files: 32,
+        max_total_bytes: 512,
+    };
+    let err_rel = inspector
+        .validate_dummy_output(&staging, "../outside.json", "job-c", 1, &h)
+        .unwrap_err();
+    assert_eq!(err_rel.code(), "PATH_ESCAPE");
+
+    let abs_ref = outside_json.to_string_lossy().into_owned();
+    let err_abs = inspector
+        .validate_dummy_output(&staging, &abs_ref, "job-c", 1, &h)
+        .unwrap_err();
+    assert_eq!(err_abs.code(), "PATH_ESCAPE");
+
+    // Nested valid output inside staging succeeds
+    fs::write(staging.join("sub").join("out.json"), valid_doc.to_string()).unwrap();
+    let (_, oref) = inspector
+        .validate_dummy_output(&staging, "sub/out.json", "job-c", 1, &h)
+        .unwrap();
+    assert_eq!(oref.path, "sub/out.json");
+
+    // Oversized output file (> 512 bytes) rejected and purged cleanly
+    let huge = "X".repeat(1024);
+    fs::write(staging.join("huge.json"), &huge).unwrap();
+    let err_sz = inspector
+        .validate_dummy_output(&staging, "huge.json", "job-c", 1, &h)
+        .unwrap_err();
+    assert_eq!(err_sz.code(), "SIZE_LIMIT_EXCEEDED");
+
+    purge_oversized_staging(&staging, &quarantine, "job-c", "SIZE_LIMIT_EXCEEDED").unwrap();
+    let (files_after, bytes_after) = measure_staging_usage(&staging).unwrap();
+    assert_eq!(files_after, 0);
+    assert_eq!(bytes_after, 0);
+    assert!(quarantine
+        .join("job-c")
+        .join("resource_limit_quarantine.json")
+        .exists());
+
+    // Gateway rejects traversal staging_output_ref BEFORE spawning sandbox
+    let in_dir = tmp.path().join("in");
+    fs::create_dir_all(&in_dir).unwrap();
+    let unused_worker = tmp.path().join("worker.py");
+    fs::write(&unused_worker, "").unwrap();
+    let mut gw = SecurityGateway::new(
+        PolicyEngine::default(),
+        HashChainedAuditLog::new(tmp.path().join("audit.jsonl"), true),
+        SandboxMode::Auto,
+        "Ubuntu",
+        true,
+    );
+    let mut bad_req = base_job_request(Actor::CliUser, Actor::CliUser);
+    bad_req.staging_output_ref = "../outside.json".to_string();
+    let resp = gw
+        .execute_dummy_job(
+            &bad_req,
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &staging,
+                official_output_file: &official,
+                quarantine_dir: &quarantine,
+                worker_script: &unused_worker,
+                worker_args: &[],
+            },
+        )
+        .unwrap();
+    assert_eq!(resp.status, JobStatus::Failed);
+    assert_eq!(resp.error_code, Some(-32003));
+    assert_eq!(resp.diagnostics[0].code, "PATH_ESCAPE");
+    assert!(!official.exists());
 }
 
 #[test]

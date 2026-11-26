@@ -20,8 +20,12 @@ impl WslLinuxBwrapBackend {
 #[cfg(windows)]
 mod imp {
     use std::fs;
+    use std::io::Read;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -96,11 +100,42 @@ mod imp {
     struct RunnerOutput {
         exit_code: i32,
         timed_out: bool,
+        #[serde(default)]
+        stdio_limit_exceeded: bool,
+        #[serde(default)]
+        disk_limit_exceeded: bool,
         stdout: String,
         stderr: String,
         duration_ms: f64,
         #[serde(default)]
         staging_violations: Vec<String>,
+    }
+
+    fn drain_wsl_pipe_bounded<R: Read>(
+        reader: Option<R>,
+        max_bytes: usize,
+        overflow: Arc<AtomicBool>,
+    ) -> String {
+        let Some(mut r) = reader else {
+            return String::new();
+        };
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let remaining = max_bytes.saturating_sub(collected.len());
+                    let take = n.min(remaining);
+                    collected.extend_from_slice(&buf[..take]);
+                    if n > remaining {
+                        overflow.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&collected).trim().to_string()
     }
 
     pub fn run(
@@ -133,7 +168,7 @@ mod imp {
         });
         let b64 = B64.encode(payload.to_string().as_bytes());
 
-        let proc_out = Command::new("wsl")
+        let mut child = Command::new("wsl")
             .args([
                 "-d",
                 distro,
@@ -143,22 +178,64 @@ mod imp {
                 "--spec-b64",
                 &b64,
             ])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| SecurityError::SandboxUnavailable {
                 user_message: "Failed invoking WSL2 Linux sandbox runner.".to_string(),
                 detail: e.to_string(),
             })?;
 
-        if !proc_out.status.success() {
-            let err_s = String::from_utf8_lossy(&proc_out.stderr).trim().to_string();
-            let out_s = String::from_utf8_lossy(&proc_out.stdout).trim().to_string();
+        let cap = usize::try_from(spec.limits.max_stdio_bytes)
+            .unwrap_or(256 * 1024)
+            .saturating_mul(2)
+            .saturating_add(128 * 1024);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let out_ov = Arc::clone(&overflow);
+        let err_ov = Arc::clone(&overflow);
+        let out_pipe = child.stdout.take();
+        let err_pipe = child.stderr.take();
+        let out_h = thread::spawn(move || drain_wsl_pipe_bounded(out_pipe, cap, out_ov));
+        let err_h = thread::spawn(move || drain_wsl_pipe_bounded(err_pipe, cap, err_ov));
+
+        let status = loop {
+            if let Some(st) = child
+                .try_wait()
+                .map_err(|e| SecurityError::SandboxUnavailable {
+                    user_message: "Failed polling WSL2 Linux sandbox runner.".to_string(),
+                    detail: e.to_string(),
+                })?
+            {
+                break st;
+            }
+            if overflow.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SecurityError::SandboxUnavailable {
+                    user_message: "WSL2 runner exceeded IPC stdout/stderr envelope cap."
+                        .to_string(),
+                    detail: format!("cap={cap}"),
+                });
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        let stdout_full = out_h.join().unwrap_or_default();
+        let err_s = err_h.join().unwrap_or_default();
+        if overflow.load(Ordering::SeqCst) {
             return Err(SecurityError::SandboxUnavailable {
-                user_message: "WSL2 Linux sandbox runner failed (fail-closed).".to_string(),
-                detail: if err_s.is_empty() { out_s } else { err_s },
+                user_message: "WSL2 runner exceeded IPC stdout/stderr envelope cap.".to_string(),
+                detail: format!("cap={cap}"),
             });
         }
 
-        let stdout_full = String::from_utf8_lossy(&proc_out.stdout);
+        if !status.success() {
+            return Err(SecurityError::SandboxUnavailable {
+                user_message: "WSL2 Linux sandbox runner failed (fail-closed).".to_string(),
+                detail: if err_s.is_empty() { stdout_full } else { err_s },
+            });
+        }
+
         let last_line = stdout_full
             .lines()
             .rfind(|ln| !ln.trim().is_empty())
@@ -176,6 +253,8 @@ mod imp {
             backend_name: "wsl_linux_bwrap".to_string(),
             exit_code: parsed.exit_code,
             timed_out: parsed.timed_out,
+            stdio_limit_exceeded: parsed.stdio_limit_exceeded,
+            disk_limit_exceeded: parsed.disk_limit_exceeded,
             stdout: parsed.stdout,
             stderr: parsed.stderr,
             duration_ms: parsed.duration_ms,

@@ -26,6 +26,8 @@ pub struct IsolatedProcessResult {
     pub backend_name: String,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub stdio_limit_exceeded: bool,
+    pub disk_limit_exceeded: bool,
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: f64,

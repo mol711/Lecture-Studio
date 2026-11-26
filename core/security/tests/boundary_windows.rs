@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use lecture_studio_security::sandbox::{create_sandbox_backend, SandboxedProcessSpec};
+use lecture_studio_security::staging::measure_staging_usage;
 use lecture_studio_security::{
     Actor, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest, JobStatus,
     Operation, PolicyEngine, Purpose, ResourceLimits, SandboxMode, SecurityGateway,
@@ -509,6 +510,111 @@ fn windows_appcontainer_security_boundaries_sec01_to_sec06() {
         .unwrap();
     assert_eq!(r_stale.status, JobStatus::Failed);
     assert_eq!(r_stale.diagnostics[0].code, "STALE_REVISION");
+
+    // 7. SEC-04 (Finding 2): Bounded stdio terminates flood job and caps Gateway memory
+    let st_stdio = tmp.path().join("st_stdio");
+    let stdio_out = official_dir.join("should_not_exist_stdio.json");
+    let r_stdio = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_stdio_bytes: 32 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-w-stdio", "req-w-stdio", &in_hash, "out.json")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_stdio,
+                official_output_file: &stdio_out,
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &["--mode".into(), "resource_stdio_flood".into()],
+            },
+        )
+        .unwrap();
+    assert_eq!(r_stdio.status, JobStatus::Cancelled);
+    assert_eq!(r_stdio.error_code, Some(-32005));
+    assert_eq!(r_stdio.diagnostics[0].code, "STDIO_LIMIT_EXCEEDED");
+    assert!(r_stdio.diagnostics[0].message.len() <= 32 * 1024 + 128);
+    assert!(!stdio_out.exists());
+
+    // 8. SEC-04 (Finding 3): Runtime disk flood (single-file & multi-file spray) terminates and purges staging
+    let st_disk1 = tmp.path().join("st_disk1");
+    let r_disk1 = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_output_bytes: 256 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-w-disk1", "req-w-disk1", &in_hash, "flood.bin")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_disk1,
+                official_output_file: &official_dir.join("should_not_exist_disk1.json"),
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[
+                    "--mode".into(),
+                    "resource_disk_single".into(),
+                    "--output".into(),
+                    "{STAGING_DIR}\\flood.bin".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(r_disk1.status, JobStatus::Cancelled);
+    assert_eq!(r_disk1.diagnostics[0].code, "DISK_LIMIT_EXCEEDED");
+    let (d1_files, d1_bytes) = measure_staging_usage(&st_disk1).unwrap();
+    assert_eq!(d1_files, 0);
+    assert_eq!(d1_bytes, 0);
+    assert!(quarantine_dir
+        .join("job-w-disk1")
+        .join("resource_limit_quarantine.json")
+        .exists());
+
+    let st_disk2 = tmp.path().join("st_disk2");
+    let r_disk2 = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_output_bytes: 256 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-w-disk2", "req-w-disk2", &in_hash, "out.json")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_disk2,
+                official_output_file: &official_dir.join("should_not_exist_disk2.json"),
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[
+                    "--mode".into(),
+                    "resource_disk_spray".into(),
+                    "--output".into(),
+                    "{STAGING_DIR}".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(r_disk2.status, JobStatus::Cancelled);
+    assert_eq!(r_disk2.diagnostics[0].code, "DISK_LIMIT_EXCEEDED");
+    let (d2_files, d2_bytes) = measure_staging_usage(&st_disk2).unwrap();
+    assert_eq!(d2_files, 0);
+    assert_eq!(d2_bytes, 0);
+
+    // Pre-existing official artifact & input remain intact after all resource limit aborts
+    assert!(official_dir.join("w01.json").exists());
+    assert_eq!(fs::read(&in_file).unwrap(), in_bytes);
 
     // Verify audit chain on the main audit log
     let (chain_ok, entries, reason) = HashChainedAuditLog::new(&audit_path, true)

@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use lecture_studio_security::sandbox::{create_sandbox_backend, SandboxedProcessSpec};
+use lecture_studio_security::staging::measure_staging_usage;
 use lecture_studio_security::{
     Actor, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest, JobStatus,
     Operation, PolicyEngine, Purpose, ResourceLimits, SandboxMode, SecurityGateway,
@@ -352,7 +353,130 @@ fn linux_bwrap_cgroups_seccomp_security_boundaries() {
     assert_eq!(r_sym.status, JobStatus::Quarantined);
     assert!(!sym_out.exists());
 
-    // 6. Verify hash-chained audit log
+    // 6. SEC-04 (Finding 2): Bounded stdio terminates flood job and caps Gateway memory
+    let st_l_stdio = tmp.path().join("st_l_stdio");
+    let stdio_out = official_dir.join("should_not_exist_l_stdio.json");
+    let r_stdio = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_stdio_bytes: 32 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-l-stdio", "req-l-stdio", &in_hash, "out.json")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_l_stdio,
+                official_output_file: &stdio_out,
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &["--mode".into(), "resource_stdio_flood".into()],
+            },
+        )
+        .unwrap();
+    assert_eq!(r_stdio.status, JobStatus::Cancelled);
+    assert_eq!(r_stdio.error_code, Some(-32005));
+    assert_eq!(r_stdio.diagnostics[0].code, "STDIO_LIMIT_EXCEEDED");
+    assert!(r_stdio.diagnostics[0].message.len() <= 32 * 1024 + 128);
+    assert!(!stdio_out.exists());
+
+    // 7. SEC-04 (Finding 3): Linux kernel RLIMIT_FSIZE + runtime staging cap + bounded /tmp tmpfs
+    let st_l_disk1 = tmp.path().join("st_l_disk1");
+    let r_disk1 = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_output_bytes: 256 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-l-disk1", "req-l-disk1", &in_hash, "flood.bin")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_l_disk1,
+                official_output_file: &official_dir.join("should_not_exist_l_disk1.json"),
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[
+                    "--mode".into(),
+                    "resource_disk_single".into(),
+                    "--output".into(),
+                    "{STAGING_DIR}/flood.bin".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(r_disk1.status, JobStatus::Cancelled | JobStatus::Failed),
+        "single-file disk flood must not commit or pass: {:?}",
+        r_disk1
+    );
+    let (_, d1_bytes) = measure_staging_usage(&st_l_disk1).unwrap();
+    assert_eq!(d1_bytes, 0);
+
+    let st_l_disk2 = tmp.path().join("st_l_disk2");
+    let r_disk2 = gw
+        .execute_dummy_job(
+            &JobRequest {
+                resource_limits: ResourceLimits {
+                    max_output_bytes: 256 * 1024,
+                    ..ResourceLimits::default()
+                },
+                ..make_req("job-l-disk2", "req-l-disk2", &in_hash, "out.json")
+            },
+            &JobExecutionContext {
+                trusted_channel_actor: Actor::CliUser,
+                current_revision: 1,
+                input_dir: &in_dir,
+                staging_dir: &st_l_disk2,
+                official_output_file: &official_dir.join("should_not_exist_l_disk2.json"),
+                quarantine_dir: &quarantine_dir,
+                worker_script: &worker,
+                worker_args: &[
+                    "--mode".into(),
+                    "resource_disk_spray".into(),
+                    "--output".into(),
+                    "{STAGING_DIR}".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(r_disk2.status, JobStatus::Cancelled);
+    assert_eq!(r_disk2.diagnostics[0].code, "DISK_LIMIT_EXCEEDED");
+    let (d2_files, d2_bytes) = measure_staging_usage(&st_l_disk2).unwrap();
+    assert_eq!(d2_files, 0);
+    assert_eq!(d2_bytes, 0);
+
+    // Verify bwrap --size --tmpfs /tmp + RLIMIT_FSIZE blocks /tmp flood inside container
+    let tmp_flood_res = backend
+        .run(&SandboxedProcessSpec {
+            job_id: "l-sec04-tmp".into(),
+            worker_script: worker.clone(),
+            input_dir: in_dir.clone(),
+            staging_dir: tmp.path().join("st_l_tmp"),
+            worker_args: vec!["--mode".into(), "resource_disk_tmp".into()],
+            limits: ResourceLimits {
+                max_output_bytes: 256 * 1024,
+                ..ResourceLimits::default()
+            },
+        })
+        .unwrap();
+    assert_ne!(tmp_flood_res.exit_code, 0);
+    assert!(
+        tmp_flood_res.stdout.contains("BLOCKED_TMP_WRITE:"),
+        "expected /tmp size limit block, got: {}",
+        tmp_flood_res.stdout
+    );
+
+    assert!(official_dir.join("l01.json").exists());
+    assert_eq!(fs::read(&in_file).unwrap(), in_bytes);
+
+    // 8. Verify hash-chained audit log
     let (ok, count, reason) = HashChainedAuditLog::new(&audit_path, true)
         .verify_chain()
         .unwrap();

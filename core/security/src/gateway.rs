@@ -11,7 +11,10 @@ use crate::models::{
 };
 use crate::policy::PolicyEngine;
 use crate::sandbox::{create_sandbox_backend, SandboxBackend, SandboxedProcessSpec};
-use crate::staging::{atomic_promote, quarantine_staging, StagingInspector};
+use crate::staging::{
+    atomic_promote, purge_oversized_staging, quarantine_staging, validate_relative_staging_ref,
+    StagingInspector,
+};
 
 pub struct SecurityGateway {
     pub policy: PolicyEngine,
@@ -196,6 +199,37 @@ impl SecurityGateway {
             });
         }
 
+        // Stage 2.5: Validate staging_output_ref containment BEFORE spawning worker
+        if let Err(exc) = validate_relative_staging_ref(&req.staging_output_ref) {
+            let aid = self.record_audit(
+                req,
+                AuditDecision::Deny,
+                exc.code(),
+                None,
+                Some(exc.jsonrpc_code()),
+            )?;
+            return Ok(JobResponse {
+                schema_version: "1.0.0".to_string(),
+                job_id: req.job_id.clone(),
+                status: JobStatus::Failed,
+                output_refs: Vec::new(),
+                diagnostics: vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: exc.code().to_string(),
+                    message: exc.user_message().to_string(),
+                }],
+                source_revision: req.input_revision,
+                engine_version: "security-gateway-1.0.0".to_string(),
+                metrics: JobMetrics {
+                    duration_ms: 0.0,
+                    backend: backend_label,
+                    exit_code: None,
+                },
+                audit_id: Some(aid),
+                error_code: Some(exc.jsonrpc_code()),
+            });
+        }
+
         // Stage 3: Policy authorization + Sandbox backend selection (no unsandboxed fallback)
         let rule = match self.policy.evaluate(req, trusted_channel_actor) {
             Ok(r) => r.clone(),
@@ -309,6 +343,79 @@ impl SecurityGateway {
             }
         };
 
+        if proc_res.stdio_limit_exceeded {
+            let _ = purge_oversized_staging(
+                staging_dir,
+                quarantine_dir,
+                &req.job_id,
+                "STDIO_LIMIT_EXCEEDED",
+            );
+            let aid = self.record_audit(
+                req,
+                AuditDecision::Deny,
+                "STDIO_LIMIT_EXCEEDED",
+                None,
+                Some(-32005),
+            )?;
+            return Ok(JobResponse {
+                schema_version: "1.0.0".to_string(),
+                job_id: req.job_id.clone(),
+                status: JobStatus::Cancelled,
+                output_refs: Vec::new(),
+                diagnostics: vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: "STDIO_LIMIT_EXCEEDED".to_string(),
+                    message: proc_res.stdout,
+                }],
+                source_revision: req.input_revision,
+                engine_version: "security-gateway-1.0.0".to_string(),
+                metrics: JobMetrics {
+                    duration_ms: proc_res.duration_ms,
+                    backend: proc_res.backend_name,
+                    exit_code: Some(proc_res.exit_code),
+                },
+                audit_id: Some(aid),
+                error_code: Some(-32005),
+            });
+        }
+
+        if proc_res.disk_limit_exceeded {
+            let _ = purge_oversized_staging(
+                staging_dir,
+                quarantine_dir,
+                &req.job_id,
+                "DISK_LIMIT_EXCEEDED",
+            );
+            let aid = self.record_audit(
+                req,
+                AuditDecision::Deny,
+                "DISK_LIMIT_EXCEEDED",
+                None,
+                Some(-32005),
+            )?;
+            return Ok(JobResponse {
+                schema_version: "1.0.0".to_string(),
+                job_id: req.job_id.clone(),
+                status: JobStatus::Cancelled,
+                output_refs: Vec::new(),
+                diagnostics: vec![DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: "DISK_LIMIT_EXCEEDED".to_string(),
+                    message: "Worker exceeded runtime staging disk limit and was terminated."
+                        .to_string(),
+                }],
+                source_revision: req.input_revision,
+                engine_version: "security-gateway-1.0.0".to_string(),
+                metrics: JobMetrics {
+                    duration_ms: proc_res.duration_ms,
+                    backend: proc_res.backend_name,
+                    exit_code: Some(proc_res.exit_code),
+                },
+                audit_id: Some(aid),
+                error_code: Some(-32005),
+            });
+        }
+
         if proc_res.timed_out {
             let _ = quarantine_staging(staging_dir, quarantine_dir, &req.job_id);
             let aid = self.record_audit(
@@ -412,10 +519,9 @@ impl SecurityGateway {
             max_files: 32,
             max_total_bytes: req.resource_limits.max_output_bytes,
         };
-        let staging_target = staging_dir.join(&req.staging_output_ref);
         let (raw_bytes, out_ref) = match inspector.validate_dummy_output(
             staging_dir,
-            &staging_target,
+            &req.staging_output_ref,
             &req.job_id,
             req.input_revision,
             &req.input_hash,

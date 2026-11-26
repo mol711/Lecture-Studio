@@ -106,6 +106,7 @@
         "cpu_quota_percent": { "type": "integer", "minimum": 1, "maximum": 100 },
         "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 3600000 },
         "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 104857600 },
+        "max_stdio_bytes": { "type": "integer", "minimum": 1024, "maximum": 4194304 },
         "allow_network": { "type": "boolean", "const": false }
       }
     }

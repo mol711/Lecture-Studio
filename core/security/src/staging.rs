@@ -1,8 +1,9 @@
-//! Staging inspection (symlink/reparse-point rejection), quarantine, and atomic promotion.
+//! Staging inspection (containment, symlink/reparse-point rejection), quarantine, and atomic promotion.
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,84 @@ fn is_reparse_or_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
+/// Validate that `staging_ref` is a safe relative path strictly contained inside staging.
+pub fn validate_relative_staging_ref(staging_ref: &str) -> Result<PathBuf, SecurityError> {
+    if staging_ref.is_empty()
+        || staging_ref
+            .chars()
+            .any(|c| c == '\0' || c.is_control() || c == ':')
+        || staging_ref.starts_with('/')
+        || staging_ref.starts_with('\\')
+    {
+        return Err(SecurityError::StagingInspection {
+            code: "PATH_ESCAPE",
+            user_message:
+                "staging_output_ref must be a relative path without drive, colon, or root prefix."
+                    .to_string(),
+            detail: staging_ref.to_string(),
+        });
+    }
+
+    let mut clean = PathBuf::new();
+    for segment in staging_ref.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(SecurityError::StagingInspection {
+                code: "PATH_ESCAPE",
+                user_message: "staging_output_ref contains disallowed traversal or empty segments."
+                    .to_string(),
+                detail: staging_ref.to_string(),
+            });
+        }
+        clean.push(segment);
+    }
+
+    if clean.as_os_str().is_empty()
+        || clean
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(SecurityError::StagingInspection {
+            code: "PATH_ESCAPE",
+            user_message: "staging_output_ref must contain only normal path components."
+                .to_string(),
+            detail: staging_ref.to_string(),
+        });
+    }
+
+    Ok(clean)
+}
+
+/// Measure current file count and total byte size inside `staging_root` without following links.
+pub fn measure_staging_usage(staging_root: &Path) -> Result<(usize, u64), SecurityError> {
+    if !staging_root.exists() {
+        return Ok((0, 0));
+    }
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![staging_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if is_reparse_or_link(&meta) {
+                continue;
+            }
+            if meta.file_type().is_dir() {
+                stack.push(p);
+            } else if meta.file_type().is_file() {
+                files = files.saturating_add(1);
+                bytes = bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
 #[derive(Debug, Clone)]
 pub struct StagingInspector {
     pub max_files: usize,
@@ -38,7 +117,7 @@ impl Default for StagingInspector {
 }
 
 impl StagingInspector {
-    pub fn scan_directory(&self, staging_root: &Path) -> Result<Vec<PathBuf>, SecurityError> {
+    pub fn scan_directory(&self, staging_root: &Path) -> Result<HashSet<PathBuf>, SecurityError> {
         let root_meta =
             fs::symlink_metadata(staging_root).map_err(|e| SecurityError::StagingInspection {
                 code: "STAGING_MISSING",
@@ -60,7 +139,7 @@ impl StagingInspector {
                 detail: e.to_string(),
             })?;
 
-        let mut collected = Vec::new();
+        let mut collected = HashSet::new();
         let mut total_bytes = 0u64;
         self.walk_dir(
             staging_root,
@@ -75,7 +154,7 @@ impl StagingInspector {
         &self,
         dir: &Path,
         canonical_root: &Path,
-        collected: &mut Vec<PathBuf>,
+        collected: &mut HashSet<PathBuf>,
         total_bytes: &mut u64,
     ) -> Result<(), SecurityError> {
         let entries = fs::read_dir(dir).map_err(|e| SecurityError::StagingInspection {
@@ -126,7 +205,7 @@ impl StagingInspector {
                 self.walk_dir(&path, canonical_root, collected, total_bytes)?;
             } else if meta.file_type().is_file() {
                 *total_bytes = total_bytes.saturating_add(meta.len());
-                collected.push(path);
+                collected.insert(canonical_path);
                 if collected.len() > self.max_files {
                     return Err(SecurityError::StagingInspection {
                         code: "TOO_MANY_FILES",
@@ -156,15 +235,23 @@ impl StagingInspector {
     pub fn validate_dummy_output(
         &self,
         staging_root: &Path,
-        output_file: &Path,
+        staging_output_ref: &str,
         expected_job_id: &str,
         expected_revision: u64,
         expected_input_hash: &str,
     ) -> Result<(Vec<u8>, OutputRef), SecurityError> {
-        self.scan_directory(staging_root)?;
+        let rel = validate_relative_staging_ref(staging_output_ref)?;
+        let scanned_files = self.scan_directory(staging_root)?;
+        let canonical_root =
+            fs::canonicalize(staging_root).map_err(|e| SecurityError::StagingInspection {
+                code: "STAGING_MISSING",
+                user_message: "Failed to resolve staging root.".to_string(),
+                detail: e.to_string(),
+            })?;
 
+        let output_file = staging_root.join(&rel);
         let meta =
-            fs::symlink_metadata(output_file).map_err(|e| SecurityError::StagingInspection {
+            fs::symlink_metadata(&output_file).map_err(|e| SecurityError::StagingInspection {
                 code: "MISSING_OUTPUT",
                 user_message: "Expected output file was not produced in staging.".to_string(),
                 detail: format!("{}: {e}", output_file.display()),
@@ -176,12 +263,53 @@ impl StagingInspector {
                 detail: output_file.display().to_string(),
             });
         }
+        if meta.len() > self.max_total_bytes {
+            return Err(SecurityError::StagingInspection {
+                code: "SIZE_LIMIT_EXCEEDED",
+                user_message: "Target output file exceeds allowed byte limit.".to_string(),
+                detail: format!("bytes={} limit={}", meta.len(), self.max_total_bytes),
+            });
+        }
 
-        let raw = fs::read(output_file).map_err(|e| SecurityError::StagingInspection {
+        let canonical_output =
+            fs::canonicalize(&output_file).map_err(|e| SecurityError::StagingInspection {
+                code: "PATH_ESCAPE",
+                user_message: "Failed canonicalizing target output file.".to_string(),
+                detail: e.to_string(),
+            })?;
+        if !canonical_output.starts_with(&canonical_root)
+            || !scanned_files.contains(&canonical_output)
+        {
+            return Err(SecurityError::StagingInspection {
+                code: "PATH_ESCAPE",
+                user_message: "Target output file is outside scanned staging containment."
+                    .to_string(),
+                detail: canonical_output.display().to_string(),
+            });
+        }
+
+        let fh = fs::File::open(&output_file).map_err(|e| SecurityError::StagingInspection {
             code: "MISSING_OUTPUT",
-            user_message: "Failed reading staging output file.".to_string(),
+            user_message: "Failed opening staging output file.".to_string(),
             detail: e.to_string(),
         })?;
+        let mut raw = Vec::new();
+        fh.take(self.max_total_bytes.saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|e| SecurityError::StagingInspection {
+                code: "MISSING_OUTPUT",
+                user_message: "Failed reading staging output file.".to_string(),
+                detail: e.to_string(),
+            })?;
+        if raw.len() as u64 > self.max_total_bytes {
+            return Err(SecurityError::StagingInspection {
+                code: "SIZE_LIMIT_EXCEEDED",
+                user_message: "Target output exceeded allowed byte limit while reading."
+                    .to_string(),
+                detail: format!("bytes={} limit={}", raw.len(), self.max_total_bytes),
+            });
+        }
+
         let text = std::str::from_utf8(&raw).map_err(|e| SecurityError::StagingInspection {
             code: "INVALID_OUTPUT_SCHEMA",
             user_message: "Worker output is not valid UTF-8.".to_string(),
@@ -226,22 +354,66 @@ impl StagingInspector {
         let mut hasher = Sha256::new();
         hasher.update(&raw);
         let digest = hex::encode(hasher.finalize());
-        let file_name = output_file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("output.json")
-            .to_string();
-
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
         let size_bytes = raw.len() as u64;
         Ok((
             raw,
             OutputRef {
-                path: file_name,
+                path: rel_str,
                 sha256: digest,
                 size_bytes,
             },
         ))
     }
+}
+
+/// Purge oversized or resource-aborted staging contents immediately and store metadata-only record.
+pub fn purge_oversized_staging(
+    staging_root: &Path,
+    quarantine_root: &Path,
+    job_id: &str,
+    reason: &str,
+) -> Result<PathBuf, SecurityError> {
+    let q_dir = quarantine_root.join(job_id);
+    fs::create_dir_all(&q_dir).map_err(|e| SecurityError::StagingInspection {
+        code: "QUARANTINE_FAILED",
+        user_message: "Failed to prepare quarantine directory.".to_string(),
+        detail: e.to_string(),
+    })?;
+
+    let (file_count, total_bytes) = measure_staging_usage(staging_root)?;
+    if staging_root.exists() {
+        if let Ok(entries) = fs::read_dir(staging_root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Ok(meta) = fs::symlink_metadata(&p) {
+                    if is_reparse_or_link(&meta) {
+                        if meta.file_type().is_dir() {
+                            let _ = fs::remove_dir(&p);
+                        } else {
+                            let _ = fs::remove_file(&p);
+                        }
+                    } else if meta.file_type().is_dir() {
+                        let _ = fs::remove_dir_all(&p);
+                    } else {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = fs::write(
+        q_dir.join("resource_limit_quarantine.json"),
+        json!({
+            "job_id": job_id,
+            "reason": reason,
+            "purged_files": file_count,
+            "purged_bytes": total_bytes,
+        })
+        .to_string(),
+    );
+    Ok(q_dir)
 }
 
 pub fn quarantine_staging(

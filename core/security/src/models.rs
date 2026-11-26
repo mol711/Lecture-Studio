@@ -143,6 +143,10 @@ impl SandboxMode {
     }
 }
 
+fn default_max_stdio_bytes() -> u64 {
+    256 * 1024
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
@@ -151,6 +155,8 @@ pub struct ResourceLimits {
     pub cpu_quota_percent: u32,
     pub timeout_ms: u64,
     pub max_output_bytes: u64,
+    #[serde(default = "default_max_stdio_bytes")]
+    pub max_stdio_bytes: u64,
     pub allow_network: bool,
 }
 
@@ -162,6 +168,7 @@ impl Default for ResourceLimits {
             cpu_quota_percent: 50,
             timeout_ms: 15_000,
             max_output_bytes: 1024 * 1024,
+            max_stdio_bytes: default_max_stdio_bytes(),
             allow_network: false,
         }
     }
