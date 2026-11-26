@@ -10,6 +10,7 @@ use lecture_studio_security::{
     Actor, DataClassification, HashChainedAuditLog, JobExecutionContext, JobRequest, JobStatus,
     Operation, PolicyEngine, Purpose, ResourceLimits, SandboxMode, SecurityGateway,
 };
+use lecture_studio_workspace::{ProjectMode, WorkspaceManager};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -67,6 +68,88 @@ enum Commands {
         quarantine_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 1)]
         revision: u64,
+    },
+    /// Manage Phase 2 workspaces, durable projects, snapshots, recovery, and exchange tasks.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCommands,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliProjectMode {
+    LatexFirst,
+    TypstFirst,
+}
+
+impl From<CliProjectMode> for ProjectMode {
+    fn from(m: CliProjectMode) -> Self {
+        match m {
+            CliProjectMode::LatexFirst => Self::LatexFirst,
+            CliProjectMode::TypstFirst => Self::TypstFirst,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommands {
+    Init {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long = "allow-input", required = true)]
+        allow_inputs: Vec<PathBuf>,
+        #[arg(long = "allow-output", required = true)]
+        allow_outputs: Vec<PathBuf>,
+    },
+    CreateProject {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        title: String,
+        #[arg(long, value_enum, default_value_t = CliProjectMode::LatexFirst)]
+        mode: CliProjectMode,
+        #[arg(long, default_value = "latex/main.tex")]
+        entry: String,
+        #[arg(long)]
+        content_file: PathBuf,
+    },
+    Save {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        rel_path: String,
+        #[arg(long)]
+        content_file: PathBuf,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    Snapshot {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Restore {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        snapshot_id: String,
+    },
+    Recover {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    IngestExchange {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        task_file: PathBuf,
     },
 }
 
@@ -215,6 +298,203 @@ fn main() -> ExitCode {
                 }
                 Err(err) => {
                     eprintln!("{err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Commands::Workspace { action } => run_workspace_command(action),
+    }
+}
+
+fn run_workspace_command(action: WorkspaceCommands) -> ExitCode {
+    match action {
+        WorkspaceCommands::Init {
+            root,
+            allow_inputs,
+            allow_outputs,
+        } => match WorkspaceManager::init_workspace(root, allow_inputs, allow_outputs) {
+            Ok(ws) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(ws.config()).unwrap_or_default()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            }
+        },
+        WorkspaceCommands::CreateProject {
+            root,
+            title,
+            mode,
+            entry,
+            content_file,
+        } => {
+            let Ok(bytes) = fs::read(&content_file) else {
+                eprintln!("Failed reading content file: {}", content_file.display());
+                return ExitCode::from(2);
+            };
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.create_project(
+                title,
+                mode.into(),
+                &entry,
+                &bytes,
+                DataClassification::Internal,
+                "cli_user",
+            ) {
+                Ok(proj) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&proj).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        WorkspaceCommands::Save {
+            root,
+            project_id,
+            rel_path,
+            content_file,
+            expected_revision,
+        } => {
+            let Ok(bytes) = fs::read(&content_file) else {
+                eprintln!("Failed reading content file: {}", content_file.display());
+                return ExitCode::from(2);
+            };
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.save_project_file(
+                &project_id,
+                &rel_path,
+                &bytes,
+                expected_revision,
+                None,
+                "cli_user",
+            ) {
+                Ok(proj) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&proj).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        WorkspaceCommands::Snapshot {
+            root,
+            project_id,
+            reason,
+        } => {
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.create_project_snapshot(&project_id, reason, "cli_user") {
+                Ok(snap) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&snap).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        WorkspaceCommands::Restore {
+            root,
+            project_id,
+            snapshot_id,
+        } => {
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.restore_project_snapshot(&project_id, &snapshot_id, "cli_user") {
+                Ok((proj, report)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &json!({ "project": proj, "restore": report })
+                        )
+                        .unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        WorkspaceCommands::Recover { root } => {
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.recover_workspace() {
+                Ok(rep) => {
+                    println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        WorkspaceCommands::IngestExchange { root, task_file } => {
+            let ws = match WorkspaceManager::open_workspace(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match ws.ingest_exchange_task(&task_file) {
+                Ok(task) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&task).unwrap_or_default()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
                     ExitCode::from(1)
                 }
             }

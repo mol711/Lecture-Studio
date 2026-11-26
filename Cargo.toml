@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "core/security",
+    "core/history",
+    "core/workspace",
     "app/cli",
 ]
 

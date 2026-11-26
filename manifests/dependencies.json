@@ -8,7 +8,7 @@
     "uv": "uv 0.13.9 (6b2d39dcc 2026-11-17 x86_64-pc-windows-msvc)"
   },
   "lockfiles": {
-    "Cargo.lock_sha256": "f842ed1a09b79c9a85aed9e5460921c5d7a2328bbfc5408dfde0519f5fd76a6c",
+    "Cargo.lock_sha256": "898fde05be0db96d3aaf9b1d78ff410963fb1e951567ef05ebe186ddd9c11dbf",
     "uv.lock_sha256": "45cbb2de28b85bc27963a6f0167b182bc43aac849c86ca035888cee3c2836789"
   },
   "rust_crates": [
@@ -163,6 +163,18 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
+      "name": "fallible-iterator",
+      "version": "0.3.0",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "fallible-streaming-iterator",
+      "version": "0.1.9",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
       "name": "fastrand",
       "version": "2.5.0",
       "license": "Apache-2.0 OR MIT",
@@ -172,6 +184,12 @@
       "name": "find-msvc-tools",
       "version": "0.1.15",
       "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "foldhash",
+      "version": "0.1.5",
+      "license": "Zlib",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
@@ -206,7 +224,19 @@
     },
     {
       "name": "hashbrown",
+      "version": "0.15.5",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hashbrown",
       "version": "0.17.2",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hashlink",
+      "version": "0.10.0",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
@@ -265,6 +295,12 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
+      "name": "libsqlite3-sys",
+      "version": "0.32.0",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
       "name": "linux-raw-sys",
       "version": "0.12.1",
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -307,6 +343,12 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
+      "name": "pkg-config",
+      "version": "0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
       "name": "proc-macro2",
       "version": "1.0.107",
       "license": "MIT OR Apache-2.0",
@@ -322,6 +364,12 @@
       "name": "r-efi",
       "version": "6.0.0",
       "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rusqlite",
+      "version": "0.34.0",
+      "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
@@ -391,6 +439,12 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {
+      "name": "smallvec",
+      "version": "1.16.6",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
       "name": "strsim",
       "version": "0.11.1",
       "license": "MIT",
@@ -454,6 +508,12 @@
       "name": "uuid",
       "version": "1.29.3",
       "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "vcpkg",
+      "version": "0.2.15",
+      "license": "MIT/Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
     {

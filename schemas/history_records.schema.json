@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/history_records.schema.json",
+  "title": "HistoryRecords",
+  "oneOf": [
+    { "$ref": "#/$defs/OperationRecord" },
+    { "$ref": "#/$defs/DecisionRecord" },
+    { "$ref": "#/$defs/SnapshotManifest" },
+    { "$ref": "#/$defs/ConsentRecord" }
+  ],
+  "$defs": {
+    "OperationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "event_id",
+        "timestamp_utc",
+        "actor",
+        "target_path",
+        "before_hash",
+        "after_hash",
+        "base_revision",
+        "new_revision",
+        "origin_type"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "event_id": { "type": "string", "minLength": 1 },
+        "timestamp_utc": { "type": "string", "minLength": 1 },
+        "actor": { "type": "string", "minLength": 1 },
+        "target_path": { "type": "string", "minLength": 1 },
+        "before_hash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+        "after_hash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+        "base_revision": { "type": "integer", "minimum": 0 },
+        "new_revision": { "type": "integer", "minimum": 1 },
+        "origin_type": { "type": "string", "enum": ["editor", "external_diff", "system"] },
+        "note": { "type": ["string", "null"] }
+      }
+    },
+    "DecisionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "decision_id",
+        "timestamp_utc",
+        "actor",
+        "proposal_id",
+        "outcome",
+        "explicit_reason",
+        "inferred_reason",
+        "generation_context"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "decision_id": { "type": "string", "minLength": 1 },
+        "timestamp_utc": { "type": "string", "minLength": 1 },
+        "actor": { "type": "string", "minLength": 1 },
+        "proposal_id": { "type": "string", "minLength": 1 },
+        "outcome": { "type": "string", "enum": ["accepted", "rejected", "edited", "deferred"] },
+        "explicit_reason": { "type": ["string", "null"] },
+        "inferred_reason": { "type": ["string", "null"] },
+        "generation_context": { "type": "string" }
+      }
+    },
+    "SnapshotManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "snapshot_id",
+        "project_id",
+        "revision",
+        "files",
+        "restore_refs",
+        "created_at_utc",
+        "creation_status"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "project_id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rel_path", "sha256", "size_bytes"],
+            "properties": {
+              "rel_path": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "size_bytes": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "restore_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "created_at_utc": { "type": "string", "minLength": 1 },
+        "creation_status": {
+          "type": "string",
+          "enum": ["complete", "pre_restore_backup", "failed"]
+        },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "ConsentRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "consent_id",
+        "subject_scope",
+        "purpose",
+        "grantor",
+        "granted_at_utc",
+        "policy_version",
+        "revoked_at_utc"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "consent_id": { "type": "string", "minLength": 1 },
+        "subject_scope": { "type": "string", "minLength": 1 },
+        "purpose": {
+          "type": "string",
+          "enum": ["history_save", "learning_train", "external_exchange"]
+        },
+        "grantor": { "type": "string", "minLength": 1 },
+        "granted_at_utc": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "revoked_at_utc": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

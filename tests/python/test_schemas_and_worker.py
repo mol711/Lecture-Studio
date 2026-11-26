@@ -18,10 +18,55 @@ RUNNER_SCRIPT = REPO_ROOT / "runtime" / "linux_sandbox_runner" / "runner.py"
 
 def test_all_json_schemas_valid_draft_2020_12() -> None:
     schema_files = sorted(SCHEMAS_DIR.glob("*.schema.json"))
-    assert len(schema_files) == 5
+    assert len(schema_files) == 10
     for sf in schema_files:
         schema = json.loads(sf.read_text(encoding="utf-8"))
         jsonschema.Draft202012Validator.check_schema(schema)
+
+
+def test_phase2_workspace_history_and_exchange_schemas() -> None:
+    ex_schema = json.loads((SCHEMAS_DIR / "exchange_task.schema.json").read_text(encoding="utf-8"))
+    hist_schema = json.loads(
+        (SCHEMAS_DIR / "history_records.schema.json").read_text(encoding="utf-8")
+    )
+
+    valid_ex = {
+        "schema_version": "1.0.0",
+        "task_id": "task-1",
+        "request_id": "req-1",
+        "project_id": "proj-1",
+        "actor": "external_agent",
+        "allowed_operation": "propose_edit",
+        "target_rel_path": "latex/main.tex",
+        "target_revision": 1,
+        "input_hash": "b" * 64,
+        "status": "proposed",
+        "expires_at_utc": "2026-12-01T00:00:00Z",
+        "output_hash": "c" * 64,
+        "audit_id": "aud-1",
+        "proposal_content": "\\section{Test}",
+    }
+    jsonschema.validate(instance=valid_ex, schema=ex_schema)
+
+    spoof_ex = json.loads(json.dumps(valid_ex))
+    spoof_ex["actor"] = "cli_user"
+    try:
+        jsonschema.validate(instance=spoof_ex, schema=ex_schema)
+        raise AssertionError("non-external_agent actor must fail exchange schema")
+    except jsonschema.ValidationError:
+        pass
+
+    valid_consent = {
+        "schema_version": "1.0.0",
+        "consent_id": "c-1",
+        "subject_scope": "proj-1",
+        "purpose": "history_save",
+        "grantor": "teacher",
+        "granted_at_utc": "2026-11-26T00:00:00Z",
+        "policy_version": "1.0.0",
+        "revoked_at_utc": None,
+    }
+    jsonschema.validate(instance=valid_consent, schema=hist_schema)
 
 
 def test_job_request_and_ipc_schema_reject_network_or_unknown_method() -> None:

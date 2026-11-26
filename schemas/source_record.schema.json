@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/source_record.schema.json",
+  "title": "SourceRecord",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_id",
+    "origin_ref",
+    "stored_rel_path",
+    "sha256",
+    "size_bytes",
+    "original_revision",
+    "page_or_line_range",
+    "usage_permission",
+    "learning_permission",
+    "export_permission",
+    "classification",
+    "imported_at_utc"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "source_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "origin_ref": { "type": "string", "minLength": 1 },
+    "stored_rel_path": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "size_bytes": { "type": "integer", "minimum": 0 },
+    "original_revision": { "type": "integer", "minimum": 1 },
+    "page_or_line_range": { "type": "string" },
+    "usage_permission": { "type": "boolean" },
+    "learning_permission": { "type": "boolean" },
+    "export_permission": { "type": "boolean" },
+    "classification": {
+      "type": "string",
+      "enum": ["Public", "Internal", "Confidential", "Restricted"]
+    },
+    "imported_at_utc": { "type": "string", "minLength": 1 }
+  }
+}

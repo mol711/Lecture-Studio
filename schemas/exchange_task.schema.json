@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/exchange_task.schema.json",
+  "title": "ExchangeTask",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "request_id",
+    "project_id",
+    "actor",
+    "allowed_operation",
+    "target_rel_path",
+    "target_revision",
+    "input_hash",
+    "status",
+    "expires_at_utc",
+    "output_hash",
+    "audit_id",
+    "proposal_content"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "project_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "actor": { "type": "string", "const": "external_agent" },
+    "allowed_operation": { "type": "string", "enum": ["propose_edit", "propose_patch"] },
+    "target_rel_path": { "type": "string", "minLength": 1 },
+    "target_revision": { "type": "integer", "minimum": 1 },
+    "input_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "proposed", "accepted", "rejected", "conflicted", "expired", "failed"]
+    },
+    "expires_at_utc": { "type": "string", "minLength": 1 },
+    "output_hash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+    "audit_id": { "type": ["string", "null"] },
+    "proposal_content": { "type": "string" }
+  }
+}
