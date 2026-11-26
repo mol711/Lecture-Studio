@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/audit_record.schema.json",
+  "title": "AuditRecord",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "audit_id",
+    "timestamp_utc",
+    "actor",
+    "operation",
+    "purpose",
+    "project_id",
+    "job_id",
+    "policy_version",
+    "classification",
+    "input_hash",
+    "output_hash",
+    "decision",
+    "reason_code",
+    "error_code",
+    "prev_hash",
+    "entry_hash"
+  ],
+  "properties": {
+    "audit_id": { "type": "string", "minLength": 1 },
+    "timestamp_utc": { "type": "string", "minLength": 1 },
+    "actor": { "type": "string", "minLength": 1 },
+    "operation": { "type": "string", "minLength": 1 },
+    "purpose": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "classification": {
+      "type": "string",
+      "enum": ["Public", "Internal", "Confidential", "Restricted"]
+    },
+    "input_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "output_hash": { "type": ["string", "null"] },
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "deny", "quarantine", "fail_closed", "proposed"]
+    },
+    "reason_code": { "type": "string", "minLength": 1 },
+    "error_code": { "type": ["integer", "null"] },
+    "prev_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "entry_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

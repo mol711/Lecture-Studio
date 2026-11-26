@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/policy.schema.json",
+  "title": "PolicyConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_version", "default_allow_network", "rules"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "default_allow_network": { "type": "boolean", "const": false },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "actor",
+          "allowed_operations",
+          "max_classification",
+          "can_commit_official",
+          "allow_network"
+        ],
+        "properties": {
+          "actor": { "type": "string", "minLength": 1 },
+          "allowed_operations": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "max_classification": {
+            "type": "string",
+            "enum": ["Public", "Internal", "Confidential", "Restricted"]
+          },
+          "can_commit_official": { "type": "boolean" },
+          "allow_network": { "type": "boolean", "const": false }
+        }
+      }
+    }
+  }
+}

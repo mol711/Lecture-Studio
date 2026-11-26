@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/ipc_envelope.schema.json",
+  "title": "IpcJsonRpcEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jsonrpc", "id", "method", "params"],
+  "properties": {
+    "jsonrpc": { "type": "string", "const": "2.0" },
+    "id": { "type": ["string", "integer"] },
+    "method": {
+      "type": "string",
+      "enum": ["job.submit", "job.cancel", "job.status", "sandbox.list_backends"]
+    },
+    "params": {
+      "type": "object"
+    }
+  }
+}

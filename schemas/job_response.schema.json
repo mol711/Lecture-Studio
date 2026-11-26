@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/job_response.schema.json",
+  "title": "JobResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "status",
+    "output_refs",
+    "diagnostics",
+    "source_revision",
+    "engine_version",
+    "metrics",
+    "audit_id"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "committed", "failed", "cancelled", "quarantined"]
+    },
+    "output_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "size_bytes"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "code", "message"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["info", "warning", "error"] },
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "source_revision": { "type": "integer", "minimum": 0 },
+    "engine_version": { "type": "string", "minLength": 1 },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_ms", "backend"],
+      "properties": {
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "backend": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": "integer" }
+      }
+    },
+    "audit_id": { "type": ["string", "null"] },
+    "error_code": { "type": ["integer", "null"] }
+  }
+}

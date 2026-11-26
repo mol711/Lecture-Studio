@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lecture-studio.local/schemas/job_request.schema.json",
+  "title": "JobRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "job_id",
+    "actor",
+    "claimed_actor",
+    "project_id",
+    "operation",
+    "purpose",
+    "policy_version",
+    "input_revision",
+    "input_hash",
+    "classification",
+    "allowed_inputs",
+    "staging_output_ref",
+    "resource_limits"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "job_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "actor": {
+      "type": "string",
+      "enum": [
+        "gui_user",
+        "cli_user",
+        "external_agent",
+        "worker_dummy",
+        "worker_compiler",
+        "worker_converter",
+        "worker_ai",
+        "worker_trainer",
+        "worker_code_test"
+      ]
+    },
+    "claimed_actor": {
+      "type": "string",
+      "enum": [
+        "gui_user",
+        "cli_user",
+        "external_agent",
+        "worker_dummy",
+        "worker_compiler",
+        "worker_converter",
+        "worker_ai",
+        "worker_trainer",
+        "worker_code_test"
+      ]
+    },
+    "project_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "dummy_echo",
+        "dummy_probe",
+        "compile_latex",
+        "compile_typst",
+        "convert_ir",
+        "ai_propose",
+        "code_test"
+      ]
+    },
+    "purpose": {
+      "type": "string",
+      "enum": [
+        "security_verification",
+        "edit_preview",
+        "export_zip",
+        "ai_assist",
+        "evaluation"
+      ]
+    },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "input_revision": { "type": "integer", "minimum": 0 },
+    "input_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "classification": {
+      "type": "string",
+      "enum": ["Public", "Internal", "Confidential", "Restricted"]
+    },
+    "allowed_inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "staging_output_ref": { "type": "string", "minLength": 1 },
+    "resource_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_memory_bytes",
+        "max_processes",
+        "cpu_quota_percent",
+        "timeout_ms",
+        "max_output_bytes",
+        "allow_network"
+      ],
+      "properties": {
+        "max_memory_bytes": { "type": "integer", "minimum": 1048576 },
+        "max_processes": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "cpu_quota_percent": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+        "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 104857600 },
+        "allow_network": { "type": "boolean", "const": false }
+      }
+    }
+  }
+}
