@@ -160,6 +160,7 @@ pub struct IndexRebuildStats {
 pub enum CommitPhase {
     Prepared,
     Audited,
+    Conflicted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +181,8 @@ pub struct CommitJournal {
     pub staged_temp_rel_path: String,
     pub audit_id: Option<String>,
     pub phase: CommitPhase,
+    #[serde(default)]
+    pub conflict_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +194,8 @@ pub struct RecoveryReport {
     pub project_history_dropped_lines: usize,
     pub rolled_back_journals: usize,
     pub rolled_forward_journals: usize,
+    pub conflicted_journals: usize,
+    pub conflicted_projects: Vec<String>,
     pub skipped_locked_projects: usize,
     pub removed_orphan_temps: usize,
     pub index_rebuilt: bool,

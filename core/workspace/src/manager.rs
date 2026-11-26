@@ -520,7 +520,21 @@ impl WorkspaceManager {
         let _lock = ProjectLockGuard::acquire(&p_dir)?;
 
         let journal_path = p_dir.join("history").join(".commit_journal.json");
-        if to_long_path(&journal_path).exists() {
+        let ext_journal = to_long_path(&journal_path);
+        if ext_journal.exists() {
+            if let Ok(raw) = fs::read_to_string(&ext_journal) {
+                if let Ok(j) = serde_json::from_str::<CommitJournal>(&raw) {
+                    if j.phase == CommitPhase::Conflicted {
+                        return Err(WorkspaceError::new(
+                            "RECOVERY_CONFLICT",
+                            format!(
+                                "Commit recovery conflict held for this project ({}); resolve preserved external/staged data before saving.",
+                                j.conflict_reason.as_deref().unwrap_or("state diverged")
+                            ),
+                        ));
+                    }
+                }
+            }
             return Err(WorkspaceError::new(
                 "RECOVERY_REQUIRED",
                 "Unfinished commit journal detected; run recover_workspace before saving.",
@@ -613,6 +627,7 @@ impl WorkspaceManager {
             staged_temp_rel_path: staged_rel,
             audit_id: None,
             phase: CommitPhase::Prepared,
+            conflict_reason: None,
         };
         let j_bytes = serde_json::to_vec_pretty(&journal)
             .map_err(|e| WorkspaceError::new("SERIALIZE_ERROR", e.to_string()))?;
@@ -1278,9 +1293,7 @@ impl WorkspaceManager {
         &self,
         p_dir: &Path,
         project_id: &str,
-        rolled_back: &mut usize,
-        rolled_forward: &mut usize,
-        removed_temps: &mut usize,
+        counters: &mut JournalRecoveryCounters,
     ) -> Result<(), WorkspaceError> {
         let journal_path = p_dir.join("history").join(".commit_journal.json");
         let ext_journal = to_long_path(&journal_path);
@@ -1289,7 +1302,7 @@ impl WorkspaceManager {
         }
         let raw = fs::read_to_string(&ext_journal)
             .map_err(|e| WorkspaceError::new("JOURNAL_READ_ERROR", e.to_string()))?;
-        let journal: CommitJournal = serde_json::from_str(&raw)
+        let mut journal: CommitJournal = serde_json::from_str(&raw)
             .map_err(|e| WorkspaceError::new("JOURNAL_CORRUPT", e.to_string()))?;
         if journal.project_id != project_id {
             return Err(WorkspaceError::new(
@@ -1320,25 +1333,107 @@ impl WorkspaceManager {
             CommitPhase::Prepared => {
                 // Crashed before mandatory audit completed: roll back safely without modifying canonical files.
                 if ext_staged.exists() && fs::remove_file(&ext_staged).is_ok() {
-                    *removed_temps += 1;
+                    counters.removed_temps += 1;
                 }
                 fs::remove_file(&ext_journal)
                     .map_err(|e| WorkspaceError::new("JOURNAL_CLEANUP_FAILED", e.to_string()))?;
-                *rolled_back += 1;
+                counters.rolled_back += 1;
+            }
+            CommitPhase::Conflicted => {
+                // Already quarantined as a conflict: preserve external disk state, staged payload, and journal idempotently.
+                counters.conflicted += 1;
+                counters.conflicted_projects.push(project_id.to_string());
             }
             CommitPhase::Audited => {
-                // Audited commit point reached: idempotently finish applying canonical file, project.yaml, and history.
+                // Inspect both project.yaml and current on-disk canonical file BEFORE mutating anything.
                 let (norm_target, target_rel_pb) =
                     ensure_canonical_content_rel_path(&journal.target_rel_path)?;
                 let target_abs = p_dir.join(&target_rel_pb);
                 ensure_no_symlink_in_path(&target_abs)?;
                 let ext_target = to_long_path(&target_abs);
 
-                let target_needs_write = match fs::read(&ext_target) {
-                    Ok(existing) => sha256_hex(&existing) != journal.after_hash,
-                    Err(_) => true,
+                let mut project = self.load_project(project_id)?;
+                let tracked_hash = project
+                    .tracked_files
+                    .get(&norm_target)
+                    .map(|f| f.sha256.as_str());
+                let current_disk_hash = match fs::read(&ext_target) {
+                    Ok(bytes) => Some(sha256_hex(&bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(WorkspaceError::new("IO_ERROR", e.to_string())),
                 };
-                if target_needs_write {
+
+                let proj_is_base = project.revision == journal.base_revision
+                    && tracked_hash == journal.before_hash.as_deref();
+                let proj_is_target = project.revision == journal.target_revision
+                    && tracked_hash == Some(journal.after_hash.as_str());
+                let disk_is_before = current_disk_hash == journal.before_hash;
+                let disk_is_after =
+                    current_disk_hash.as_deref() == Some(journal.after_hash.as_str());
+
+                let can_roll_forward = (proj_is_base && disk_is_before)
+                    || (proj_is_base && disk_is_after)
+                    || (proj_is_target && disk_is_after);
+
+                if !can_roll_forward {
+                    let mut reasons = Vec::new();
+                    if !(proj_is_base || proj_is_target) {
+                        reasons.push(format!(
+                            "project state diverged (revision={}, expected {} or {}; tracked_hash={:?}, expected before={:?} or after={})",
+                            project.revision,
+                            journal.base_revision,
+                            journal.target_revision,
+                            tracked_hash,
+                            journal.before_hash,
+                            journal.after_hash,
+                        ));
+                    }
+                    if !(disk_is_before || disk_is_after) {
+                        reasons.push(format!(
+                            "on-disk file {} modified or deleted externally (disk_hash={:?}, expected before={:?} or after={})",
+                            norm_target,
+                            current_disk_hash,
+                            journal.before_hash,
+                            journal.after_hash,
+                        ));
+                    }
+                    if reasons.is_empty() {
+                        reasons.push(format!(
+                            "incompatible project/disk state (revision={}, disk_hash={:?})",
+                            project.revision, current_disk_hash
+                        ));
+                    }
+                    let reason = reasons.join("; ");
+
+                    journal.phase = CommitPhase::Conflicted;
+                    journal.conflict_reason = Some(reason);
+                    let j_bytes = serde_json::to_vec_pretty(&journal)
+                        .map_err(|e| WorkspaceError::new("SERIALIZE_ERROR", e.to_string()))?;
+                    atomic_promote(&j_bytes, &journal_path)?;
+
+                    self.append_audit(AuditAppendInput {
+                        actor: "workspace_recovery",
+                        operation: "workspace_recover_commit_journal",
+                        purpose: "edit_preview",
+                        project_id,
+                        job_id: &journal.op_event_id,
+                        policy_version: "1.0.0",
+                        classification: project.classification,
+                        input_hash: current_disk_hash.as_deref().unwrap_or(&journal.after_hash),
+                        output_hash: Some(&journal.after_hash),
+                        decision: AuditDecision::Deny,
+                        reason_code: "RECOVERY_CONFLICT",
+                        error_code: None,
+                        extra_keys: &[],
+                    })?;
+
+                    counters.conflicted += 1;
+                    counters.conflicted_projects.push(project_id.to_string());
+                    return Ok(());
+                }
+
+                // Clean roll-forward path: current state matches known crash point without external conflict.
+                if !disk_is_after {
                     let staged_bytes = fs::read(&ext_staged).map_err(|e| {
                         WorkspaceError::new(
                             "JOURNAL_RECOVERY_FAILED",
@@ -1354,14 +1449,8 @@ impl WorkspaceManager {
                     atomic_promote(&staged_bytes, &target_abs)?;
                 }
 
-                let mut project = self.load_project(project_id)?;
-                let proj_needs_update = project.revision < journal.target_revision
-                    || project
-                        .tracked_files
-                        .get(&norm_target)
-                        .is_none_or(|f| f.sha256 != journal.after_hash);
-                if proj_needs_update {
-                    project.revision = project.revision.max(journal.target_revision);
+                if proj_is_base {
+                    project.revision = journal.target_revision;
                     project.updated_at_utc = journal.timestamp_utc.clone();
                     project.tracked_files.insert(
                         norm_target.clone(),
@@ -1396,11 +1485,11 @@ impl WorkspaceManager {
                 }
 
                 if ext_staged.exists() && fs::remove_file(&ext_staged).is_ok() {
-                    *removed_temps += 1;
+                    counters.removed_temps += 1;
                 }
                 fs::remove_file(&ext_journal)
                     .map_err(|e| WorkspaceError::new("JOURNAL_CLEANUP_FAILED", e.to_string()))?;
-                *rolled_forward += 1;
+                counters.rolled_forward += 1;
             }
         }
         Ok(())
@@ -1417,10 +1506,8 @@ impl WorkspaceManager {
         )?;
 
         let mut proj_hist_dropped = 0usize;
-        let mut rolled_back_journals = 0usize;
-        let mut rolled_forward_journals = 0usize;
+        let mut j_counters = JournalRecoveryCounters::default();
         let mut skipped_locked_projects = 0usize;
-        let mut removed_orphan_temps = 0usize;
 
         let projects_dir = self.root.join("projects");
         if projects_dir.exists() {
@@ -1450,18 +1537,12 @@ impl WorkspaceManager {
                 )?;
                 proj_hist_dropped += op_rep.dropped_tail_lines + dec_rep.dropped_tail_lines;
 
-                self.reconcile_project_commit_journal(
-                    &p_dir,
-                    &proj_id,
-                    &mut rolled_back_journals,
-                    &mut rolled_forward_journals,
-                    &mut removed_orphan_temps,
-                )?;
+                self.reconcile_project_commit_journal(&p_dir, &proj_id, &mut j_counters)?;
                 drop(lock);
             }
         }
 
-        removed_orphan_temps += self.index.cleanup_recorded_index_temp()?;
+        j_counters.removed_temps += self.index.cleanup_recorded_index_temp()?;
         let need_rebuild = !self.index.verify_integrity()?;
         let stats = self.index.rebuild_from_canonical(&self.root)?;
 
@@ -1471,12 +1552,23 @@ impl WorkspaceManager {
             sources_dropped_lines: sources_rep.dropped_tail_lines,
             exchange_keys_dropped_lines: keys_rep.dropped_tail_lines,
             project_history_dropped_lines: proj_hist_dropped,
-            rolled_back_journals,
-            rolled_forward_journals,
+            rolled_back_journals: j_counters.rolled_back,
+            rolled_forward_journals: j_counters.rolled_forward,
+            conflicted_journals: j_counters.conflicted,
+            conflicted_projects: j_counters.conflicted_projects,
             skipped_locked_projects,
-            removed_orphan_temps,
+            removed_orphan_temps: j_counters.removed_temps,
             index_rebuilt: need_rebuild,
             index_stats: stats,
         })
     }
+}
+
+#[derive(Default)]
+struct JournalRecoveryCounters {
+    rolled_back: usize,
+    rolled_forward: usize,
+    conflicted: usize,
+    conflicted_projects: Vec<String>,
+    removed_temps: usize,
 }

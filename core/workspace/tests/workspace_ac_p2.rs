@@ -444,6 +444,7 @@ fn recover_workspace_preserves_user_hidden_tmp_files_and_skips_active_locked_pro
         staged_temp_rel_path: "history/.ls-stage-active.tmp".to_string(),
         audit_id: None,
         phase: CommitPhase::Prepared,
+        conflict_reason: None,
     };
     fs::write(
         p_dir.join("history/.commit_journal.json"),
@@ -615,6 +616,7 @@ fn commit_journal_recovers_mid_save_crashes_at_every_stage() {
         staged_temp_rel_path: staged_a_rel.to_string(),
         audit_id: None,
         phase: CommitPhase::Prepared,
+        conflict_reason: None,
     };
     fs::write(&journal_path, serde_json::to_string_pretty(&j_a).unwrap()).unwrap();
     assert_eq!(
@@ -652,6 +654,7 @@ fn commit_journal_recovers_mid_save_crashes_at_every_stage() {
         staged_temp_rel_path: staged_b_rel.to_string(),
         audit_id: Some("aud-b".to_string()),
         phase: CommitPhase::Audited,
+        conflict_reason: None,
     };
     fs::write(&journal_path, serde_json::to_string_pretty(&j_b).unwrap()).unwrap();
 
@@ -695,6 +698,7 @@ fn commit_journal_recovers_mid_save_crashes_at_every_stage() {
         staged_temp_rel_path: staged_c_rel.to_string(),
         audit_id: Some("aud-c".to_string()),
         phase: CommitPhase::Audited,
+        conflict_reason: None,
     };
     fs::write(&journal_path, serde_json::to_string_pretty(&j_c).unwrap()).unwrap();
 
@@ -829,4 +833,239 @@ fn workspace_and_snapshots_work_on_normal_and_deep_temp_paths() {
         )
         .unwrap();
     assert_eq!(deep_saved.revision, 2);
+}
+
+#[test]
+fn audited_journal_recovery_preserves_external_edit_and_advanced_revision_as_conflict() {
+    // 1. Post-crash external edit on canonical file (disk hash differs from both before_hash and after_hash)
+    {
+        let (_tmp, ws, pid) = setup_basic_workspace();
+        let p_dir = ws.project_dir(&pid).unwrap();
+        let main_abs = p_dir.join("latex/main.tex");
+        let ops_path = p_dir.join("history/operations.jsonl");
+        let journal_path = p_dir.join("history/.commit_journal.json");
+        let staged_rel = "history/.ls-stage-extconflict.tmp";
+        let staged_abs = p_dir.join(staged_rel);
+
+        let v1_bytes = b"\\section{Initial v1}\n";
+        let staged_v2 = b"\\section{Staged v2 After Audit}\n";
+        let external_v_edit = b"\\section{User External Edit After Crash}\n";
+
+        fs::write(&staged_abs, staged_v2).unwrap();
+        let j = CommitJournal {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            tx_id: "extconflict".to_string(),
+            project_id: pid.clone(),
+            target_rel_path: "latex/main.tex".to_string(),
+            base_revision: 1,
+            target_revision: 2,
+            before_hash: Some(sha256_hex(v1_bytes)),
+            after_hash: sha256_hex(staged_v2),
+            after_size_bytes: staged_v2.len() as u64,
+            actor: "cli_user".to_string(),
+            op_event_id: "op-ext-conflict".to_string(),
+            timestamp_utc: Utc::now().to_rfc3339(),
+            staged_temp_rel_path: staged_rel.to_string(),
+            audit_id: Some("aud-ext-conflict".to_string()),
+            phase: CommitPhase::Audited,
+            conflict_reason: None,
+        };
+        fs::write(&journal_path, serde_json::to_string_pretty(&j).unwrap()).unwrap();
+
+        // Simulate external edit occurring after crash before recover_workspace runs
+        fs::write(&main_abs, external_v_edit).unwrap();
+
+        let rep = ws.recover_workspace().unwrap();
+        assert_eq!(rep.conflicted_journals, 1);
+        assert_eq!(rep.conflicted_projects, vec![pid.clone()]);
+        assert_eq!(rep.rolled_forward_journals, 0);
+        assert_eq!(rep.rolled_back_journals, 0);
+        assert_eq!(rep.removed_orphan_temps, 0);
+
+        // External edit, staged payload, and conflicted journal MUST all be preserved
+        assert_eq!(fs::read(&main_abs).unwrap(), external_v_edit);
+        assert!(staged_abs.exists());
+        assert_eq!(fs::read(&staged_abs).unwrap(), staged_v2);
+        assert!(journal_path.exists());
+        let saved_j: CommitJournal =
+            serde_json::from_str(&fs::read_to_string(&journal_path).unwrap()).unwrap();
+        assert_eq!(saved_j.phase, CommitPhase::Conflicted);
+        assert!(saved_j.conflict_reason.is_some());
+
+        // Project revision and operations history MUST NOT be mutated
+        assert_eq!(ws.load_project(&pid).unwrap().revision, 1);
+        let ops = read_jsonl_strict::<OperationRecord>(&ops_path).unwrap();
+        assert!(!ops.iter().any(|op| op.event_id == "op-ext-conflict"));
+
+        let audit_after_first = ws.audit_log().verify_chain().unwrap();
+        assert!(audit_after_first.0);
+        assert!(audit_after_first.1 >= 2);
+
+        // Re-running recover_workspace MUST remain idempotent & preserve all conflict artifacts
+        let rep2 = ws.recover_workspace().unwrap();
+        assert_eq!(rep2.conflicted_journals, 1);
+        assert_eq!(rep2.rolled_forward_journals, 0);
+        assert_eq!(fs::read(&main_abs).unwrap(), external_v_edit);
+        assert_eq!(fs::read(&staged_abs).unwrap(), staged_v2);
+        assert!(journal_path.exists());
+        assert_eq!(ws.audit_log().verify_chain().unwrap(), audit_after_first);
+
+        // save_project_file MUST refuse blind overwrite while conflict is held
+        let err = ws
+            .save_project_file(&pid, "latex/main.tex", b"BLOCKED", 1, None, "cli_user")
+            .unwrap_err();
+        assert_eq!(err.code(), "RECOVERY_CONFLICT");
+    }
+
+    // 2. Project revision already advanced past journal.target_revision -> conflict preserved
+    {
+        let (_tmp, ws, pid) = setup_basic_workspace();
+        let p_dir = ws.project_dir(&pid).unwrap();
+        let main_abs = p_dir.join("latex/main.tex");
+        let journal_path = p_dir.join("history/.commit_journal.json");
+        let staged_rel = "history/.ls-stage-revconflict.tmp";
+        let staged_abs = p_dir.join(staged_rel);
+
+        let v1_bytes = b"\\section{Initial v1}\n";
+        ws.save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{Clean Rev2}\n",
+            1,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+        let rev3_bytes = b"\\section{Clean Rev3}\n";
+        ws.save_project_file(&pid, "latex/main.tex", rev3_bytes, 2, None, "cli_user")
+            .unwrap();
+
+        let stale_staged = b"\\section{Stale Journal v2}\n";
+        fs::write(&staged_abs, stale_staged).unwrap();
+        let j = CommitJournal {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            tx_id: "revconflict".to_string(),
+            project_id: pid.clone(),
+            target_rel_path: "latex/main.tex".to_string(),
+            base_revision: 1,
+            target_revision: 2,
+            before_hash: Some(sha256_hex(v1_bytes)),
+            after_hash: sha256_hex(stale_staged),
+            after_size_bytes: stale_staged.len() as u64,
+            actor: "cli_user".to_string(),
+            op_event_id: "op-rev-conflict".to_string(),
+            timestamp_utc: Utc::now().to_rfc3339(),
+            staged_temp_rel_path: staged_rel.to_string(),
+            audit_id: Some("aud-rev-conflict".to_string()),
+            phase: CommitPhase::Audited,
+            conflict_reason: None,
+        };
+        fs::write(&journal_path, serde_json::to_string_pretty(&j).unwrap()).unwrap();
+
+        let rep = ws.recover_workspace().unwrap();
+        assert_eq!(rep.conflicted_journals, 1);
+        assert_eq!(rep.rolled_forward_journals, 0);
+        assert_eq!(rep.removed_orphan_temps, 0);
+        assert_eq!(ws.load_project(&pid).unwrap().revision, 3);
+        assert_eq!(fs::read(&main_abs).unwrap(), rev3_bytes);
+        assert!(staged_abs.exists());
+        assert_eq!(fs::read(&staged_abs).unwrap(), stale_staged);
+        let saved_j: CommitJournal =
+            serde_json::from_str(&fs::read_to_string(&journal_path).unwrap()).unwrap();
+        assert_eq!(saved_j.phase, CommitPhase::Conflicted);
+
+        let err = ws
+            .save_project_file(&pid, "latex/main.tex", b"BLOCKED", 3, None, "cli_user")
+            .unwrap_err();
+        assert_eq!(err.code(), "RECOVERY_CONFLICT");
+    }
+
+    // 3. External deletion after crash (before_hash was Some, file deleted on disk) -> conflict preserved
+    {
+        let (_tmp, ws, pid) = setup_basic_workspace();
+        let p_dir = ws.project_dir(&pid).unwrap();
+        let main_abs = p_dir.join("latex/main.tex");
+        let journal_path = p_dir.join("history/.commit_journal.json");
+        let staged_rel = "history/.ls-stage-delconflict.tmp";
+        let staged_abs = p_dir.join(staged_rel);
+
+        let v1_bytes = b"\\section{Initial v1}\n";
+        let staged_v2 = b"\\section{Staged v2 Delete Conflict}\n";
+        fs::write(&staged_abs, staged_v2).unwrap();
+        let j = CommitJournal {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            tx_id: "delconflict".to_string(),
+            project_id: pid.clone(),
+            target_rel_path: "latex/main.tex".to_string(),
+            base_revision: 1,
+            target_revision: 2,
+            before_hash: Some(sha256_hex(v1_bytes)),
+            after_hash: sha256_hex(staged_v2),
+            after_size_bytes: staged_v2.len() as u64,
+            actor: "cli_user".to_string(),
+            op_event_id: "op-del-conflict".to_string(),
+            timestamp_utc: Utc::now().to_rfc3339(),
+            staged_temp_rel_path: staged_rel.to_string(),
+            audit_id: Some("aud-del-conflict".to_string()),
+            phase: CommitPhase::Audited,
+            conflict_reason: None,
+        };
+        fs::write(&journal_path, serde_json::to_string_pretty(&j).unwrap()).unwrap();
+
+        fs::remove_file(&main_abs).unwrap();
+
+        let rep = ws.recover_workspace().unwrap();
+        assert_eq!(rep.conflicted_journals, 1);
+        assert_eq!(rep.rolled_forward_journals, 0);
+        assert!(!main_abs.exists());
+        assert!(staged_abs.exists());
+        let saved_j: CommitJournal =
+            serde_json::from_str(&fs::read_to_string(&journal_path).unwrap()).unwrap();
+        assert_eq!(saved_j.phase, CommitPhase::Conflicted);
+    }
+
+    // 4. Clean crash right after Audited mark (before target write: disk == before_hash, rev == base_revision)
+    {
+        let (_tmp, ws, pid) = setup_basic_workspace();
+        let p_dir = ws.project_dir(&pid).unwrap();
+        let main_abs = p_dir.join("latex/main.tex");
+        let ops_path = p_dir.join("history/operations.jsonl");
+        let journal_path = p_dir.join("history/.commit_journal.json");
+        let staged_rel = "history/.ls-stage-cleanroll.tmp";
+        let staged_abs = p_dir.join(staged_rel);
+
+        let v1_bytes = b"\\section{Initial v1}\n";
+        let staged_v2 = b"\\section{Clean Roll Forward v2}\n";
+        fs::write(&staged_abs, staged_v2).unwrap();
+        let j = CommitJournal {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            tx_id: "cleanroll".to_string(),
+            project_id: pid.clone(),
+            target_rel_path: "latex/main.tex".to_string(),
+            base_revision: 1,
+            target_revision: 2,
+            before_hash: Some(sha256_hex(v1_bytes)),
+            after_hash: sha256_hex(staged_v2),
+            after_size_bytes: staged_v2.len() as u64,
+            actor: "cli_user".to_string(),
+            op_event_id: "op-clean-roll".to_string(),
+            timestamp_utc: Utc::now().to_rfc3339(),
+            staged_temp_rel_path: staged_rel.to_string(),
+            audit_id: Some("aud-clean-roll".to_string()),
+            phase: CommitPhase::Audited,
+            conflict_reason: None,
+        };
+        fs::write(&journal_path, serde_json::to_string_pretty(&j).unwrap()).unwrap();
+
+        let rep = ws.recover_workspace().unwrap();
+        assert_eq!(rep.conflicted_journals, 0);
+        assert_eq!(rep.rolled_forward_journals, 1);
+        assert_eq!(rep.removed_orphan_temps, 1);
+        assert_eq!(fs::read(&main_abs).unwrap(), staged_v2);
+        assert_eq!(ws.load_project(&pid).unwrap().revision, 2);
+        assert!(!staged_abs.exists());
+        assert!(!journal_path.exists());
+        let ops = read_jsonl_strict::<OperationRecord>(&ops_path).unwrap();
+        assert!(ops.iter().any(|op| op.event_id == "op-clean-roll"));
+    }
 }
