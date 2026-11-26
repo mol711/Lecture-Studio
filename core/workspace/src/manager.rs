@@ -11,7 +11,7 @@ use lecture_studio_history::{
     SnapshotManifest, SnapshotStatus, CANONICAL_CONTENT_DIRS, CURRENT_HISTORY_SCHEMA_VERSION,
 };
 use lecture_studio_security::audit::AuditAppendInput;
-use lecture_studio_security::staging::atomic_promote;
+use lecture_studio_security::staging::{atomic_promote, to_long_path};
 use lecture_studio_security::{AuditDecision, DataClassification, HashChainedAuditLog};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -19,9 +19,9 @@ use uuid::Uuid;
 use crate::errors::WorkspaceError;
 use crate::lock::ProjectLockGuard;
 use crate::models::{
-    ExchangeTask, ExchangeTaskStatus, ExternalChangeKind, ExternalChangeReport, ExternalFileChange,
-    FileFingerprint, ProcessedExchangeKey, ProjectConfig, ProjectMode, RecoveryReport,
-    RetentionPolicy, SourcePermissions, SourceRecord, WorkspaceConfig,
+    CommitJournal, CommitPhase, ExchangeTask, ExchangeTaskStatus, ExternalChangeKind,
+    ExternalChangeReport, ExternalFileChange, FileFingerprint, ProcessedExchangeKey, ProjectConfig,
+    ProjectMode, RecoveryReport, RetentionPolicy, SourcePermissions, SourceRecord, WorkspaceConfig,
     CURRENT_WORKSPACE_SCHEMA_VERSION,
 };
 use crate::path_guard::{
@@ -107,10 +107,11 @@ impl WorkspaceManager {
         allowed_output_roots: Vec<PathBuf>,
     ) -> Result<Self, WorkspaceError> {
         let root_pb = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root_pb).map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
+        fs::create_dir_all(to_long_path(&root_pb))
+            .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
         ensure_no_symlink_in_path(&root_pb)?;
         for sub in WORKSPACE_SUBDIRS {
-            fs::create_dir_all(root_pb.join(sub))
+            fs::create_dir_all(to_long_path(&root_pb.join(sub)))
                 .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
         }
 
@@ -246,7 +247,7 @@ impl WorkspaceManager {
 
     pub fn load_project(&self, project_id: &str) -> Result<ProjectConfig, WorkspaceError> {
         let p_dir = self.project_dir(project_id)?;
-        let p_yaml = p_dir.join("project.yaml");
+        let p_yaml = to_long_path(&p_dir.join("project.yaml"));
         let raw = fs::read_to_string(&p_yaml).map_err(|e| {
             WorkspaceError::new("PROJECT_NOT_FOUND", format!("{}: {e}", p_yaml.display()))
         })?;
@@ -305,6 +306,25 @@ impl WorkspaceManager {
         let (norm_entry, entry_pb) = ensure_canonical_content_rel_path(canonical_entry)?;
         let project_id = format!("proj-{}", Uuid::new_v4().simple());
         let p_dir = self.project_dir(&project_id)?;
+        let digest = sha256_hex(initial_content);
+
+        // Mandatory audit BEFORE creating canonical project directories/files (fail-closed)
+        self.append_audit(AuditAppendInput {
+            actor,
+            operation: "workspace_create_project",
+            purpose: "edit_preview",
+            project_id: &project_id,
+            job_id: &project_id,
+            policy_version: "1.0.0",
+            classification,
+            input_hash: &digest,
+            output_hash: Some(&digest),
+            decision: AuditDecision::Allow,
+            reason_code: "PROJECT_CREATED",
+            error_code: None,
+            extra_keys: &[],
+        })?;
+
         for sub in [
             "latex",
             "typst",
@@ -315,13 +335,12 @@ impl WorkspaceManager {
             "proposals",
             "history/snapshots/blobs",
         ] {
-            fs::create_dir_all(p_dir.join(sub))
+            fs::create_dir_all(to_long_path(&p_dir.join(sub)))
                 .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
         }
 
         let entry_abs = p_dir.join(entry_pb);
         atomic_promote(initial_content, &entry_abs)?;
-        let digest = sha256_hex(initial_content);
         let now = Utc::now().to_rfc3339();
         let mut tracked_files = BTreeMap::new();
         tracked_files.insert(
@@ -357,7 +376,7 @@ impl WorkspaceManager {
             actor: actor.to_string(),
             target_path: norm_entry,
             before_hash: None,
-            after_hash: Some(digest.clone()),
+            after_hash: Some(digest),
             base_revision: 0,
             new_revision: 1,
             origin_type: OriginType::System,
@@ -372,21 +391,6 @@ impl WorkspaceManager {
             Some("initial_project_state".to_string()),
             SnapshotStatus::Complete,
         )?;
-        self.append_audit(AuditAppendInput {
-            actor,
-            operation: "workspace_create_project",
-            purpose: "edit_preview",
-            project_id: &project_id,
-            job_id: &project_id,
-            policy_version: "1.0.0",
-            classification,
-            input_hash: &digest,
-            output_hash: Some(&digest),
-            decision: AuditDecision::Allow,
-            reason_code: "PROJECT_CREATED",
-            error_code: None,
-            extra_keys: &[],
-        })?;
         self.index.rebuild_from_canonical(&self.root)?;
         Ok(project)
     }
@@ -421,24 +425,8 @@ impl WorkspaceManager {
             .unwrap_or("source.bin");
         let stored_rel = format!("sources/originals/{source_id}_{file_name}");
         let stored_abs = self.root.join(&stored_rel);
-        atomic_promote(&raw, &stored_abs)?;
 
-        let record = SourceRecord {
-            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
-            source_id: source_id.clone(),
-            origin_ref: verified_src.to_string_lossy().into_owned(),
-            stored_rel_path: stored_rel,
-            sha256: digest.clone(),
-            size_bytes: raw.len() as u64,
-            original_revision: 1,
-            page_or_line_range: page_or_line_range.into(),
-            usage_permission: permissions.usage,
-            learning_permission: permissions.learning,
-            export_permission: permissions.export,
-            classification,
-            imported_at_utc: Utc::now().to_rfc3339(),
-        };
-        append_jsonl_record(&self.root.join("sources").join("index.jsonl"), &record)?;
+        // Mandatory audit BEFORE promoting source copy or modifying sources/index.jsonl
         self.append_audit(AuditAppendInput {
             actor,
             operation: "workspace_import_source",
@@ -454,6 +442,24 @@ impl WorkspaceManager {
             error_code: None,
             extra_keys: &[],
         })?;
+
+        atomic_promote(&raw, &stored_abs)?;
+        let record = SourceRecord {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            source_id,
+            origin_ref: verified_src.to_string_lossy().into_owned(),
+            stored_rel_path: stored_rel,
+            sha256: digest,
+            size_bytes: raw.len() as u64,
+            original_revision: 1,
+            page_or_line_range: page_or_line_range.into(),
+            usage_permission: permissions.usage,
+            learning_permission: permissions.learning,
+            export_permission: permissions.export,
+            classification,
+            imported_at_utc: Utc::now().to_rfc3339(),
+        };
+        append_jsonl_record(&self.root.join("sources").join("index.jsonl"), &record)?;
         self.index.rebuild_from_canonical(&self.root)?;
         Ok(record)
     }
@@ -470,8 +476,8 @@ impl WorkspaceManager {
         let p_dir = self.project_dir(project_id)?;
         let src_abs = p_dir.join(rel_pb);
         ensure_no_symlink_in_path(&src_abs)?;
-        let bytes =
-            fs::read(&src_abs).map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
+        let bytes = fs::read(to_long_path(&src_abs))
+            .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
         let digest = sha256_hex(&bytes);
 
         let verified_dest = verify_path_within_allowed_roots(
@@ -479,7 +485,8 @@ impl WorkspaceManager {
             &self.allowed_output_paths(),
             "PATH_OUTSIDE_ALLOWED_ROOT",
         )?;
-        atomic_promote(&bytes, &verified_dest)?;
+
+        // Mandatory audit BEFORE writing exported destination file
         self.append_audit(AuditAppendInput {
             actor,
             operation: "workspace_export_file",
@@ -495,6 +502,7 @@ impl WorkspaceManager {
             error_code: None,
             extra_keys: &[],
         })?;
+        atomic_promote(&bytes, &verified_dest)?;
         Ok(verified_dest)
     }
 
@@ -510,8 +518,16 @@ impl WorkspaceManager {
         let (norm_rel, rel_pb) = ensure_canonical_content_rel_path(rel_path)?;
         let p_dir = self.project_dir(project_id)?;
         let _lock = ProjectLockGuard::acquire(&p_dir)?;
-        let mut project = self.load_project(project_id)?;
 
+        let journal_path = p_dir.join("history").join(".commit_journal.json");
+        if to_long_path(&journal_path).exists() {
+            return Err(WorkspaceError::new(
+                "RECOVERY_REQUIRED",
+                "Unfinished commit journal detected; run recover_workspace before saving.",
+            ));
+        }
+
+        let mut project = self.load_project(project_id)?;
         if project.revision != expected_revision {
             return Err(WorkspaceError::new(
                 "REVISION_CONFLICT",
@@ -538,8 +554,9 @@ impl WorkspaceManager {
             .tracked_files
             .get(&norm_rel)
             .map(|f| f.sha256.clone());
-        let before_hash = if target_abs.exists() {
-            let cur_bytes = fs::read(&target_abs)
+        let ext_target = to_long_path(&target_abs);
+        let before_hash = if ext_target.exists() {
+            let cur_bytes = fs::read(&ext_target)
                 .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
             let disk_hash = sha256_hex(&cur_bytes);
             if tracked_hash.as_deref() != Some(disk_hash.as_str()) {
@@ -569,11 +586,72 @@ impl WorkspaceManager {
             None
         };
 
-        atomic_promote(new_content, &target_abs)?;
         let new_hash = sha256_hex(new_content);
         let base_rev = project.revision;
-        project.revision = base_rev.saturating_add(1);
+        let target_rev = base_rev.saturating_add(1);
         let now = Utc::now().to_rfc3339();
+        let tx_id = format!("tx-{}", Uuid::new_v4().simple());
+        let op_event_id = format!("op-{}", Uuid::new_v4().simple());
+        let staged_rel = format!("history/.ls-stage-{tx_id}.tmp");
+        let staged_abs = p_dir.join(&staged_rel);
+
+        // Stage 2 (Prepared): stage payload & commit journal without modifying canonical files
+        atomic_promote(new_content, &staged_abs)?;
+        let mut journal = CommitJournal {
+            schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+            tx_id,
+            project_id: project_id.to_string(),
+            target_rel_path: norm_rel.clone(),
+            base_revision: base_rev,
+            target_revision: target_rev,
+            before_hash: before_hash.clone(),
+            after_hash: new_hash.clone(),
+            after_size_bytes: new_content.len() as u64,
+            actor: actor.to_string(),
+            op_event_id: op_event_id.clone(),
+            timestamp_utc: now.clone(),
+            staged_temp_rel_path: staged_rel,
+            audit_id: None,
+            phase: CommitPhase::Prepared,
+        };
+        let j_bytes = serde_json::to_vec_pretty(&journal)
+            .map_err(|e| WorkspaceError::new("SERIALIZE_ERROR", e.to_string()))?;
+        atomic_promote(&j_bytes, &journal_path)?;
+
+        // Stage 3 (Mandatory Audit BEFORE canonical commit): abort cleanly if audit fails
+        let audit_id = match self.append_audit(AuditAppendInput {
+            actor,
+            operation: "workspace_save_file",
+            purpose: "edit_preview",
+            project_id,
+            job_id: &op_event_id,
+            policy_version: "1.0.0",
+            classification: project.classification,
+            input_hash: before_hash.as_deref().unwrap_or(&new_hash),
+            output_hash: Some(&new_hash),
+            decision: AuditDecision::Allow,
+            reason_code: "FILE_SAVED",
+            error_code: None,
+            extra_keys: &[],
+        }) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = fs::remove_file(to_long_path(&staged_abs));
+                let _ = fs::remove_file(to_long_path(&journal_path));
+                return Err(e);
+            }
+        };
+
+        // Stage 4 (Audited commit point)
+        journal.phase = CommitPhase::Audited;
+        journal.audit_id = Some(audit_id);
+        let j_audited = serde_json::to_vec_pretty(&journal)
+            .map_err(|e| WorkspaceError::new("SERIALIZE_ERROR", e.to_string()))?;
+        atomic_promote(&j_audited, &journal_path)?;
+
+        // Stage 5 (Apply canonical state idempotently)
+        atomic_promote(new_content, &target_abs)?;
+        project.revision = target_rev;
         project.updated_at_utc = now.clone();
         project.tracked_files.insert(
             norm_rel.clone(),
@@ -586,33 +664,22 @@ impl WorkspaceManager {
 
         let op = OperationRecord {
             schema_version: CURRENT_HISTORY_SCHEMA_VERSION.to_string(),
-            event_id: format!("op-{}", Uuid::new_v4().simple()),
+            event_id: op_event_id,
             timestamp_utc: now,
             actor: actor.to_string(),
             target_path: norm_rel,
-            before_hash: before_hash.clone(),
-            after_hash: Some(new_hash.clone()),
+            before_hash,
+            after_hash: Some(new_hash),
             base_revision: base_rev,
-            new_revision: project.revision,
+            new_revision: target_rev,
             origin_type: OriginType::Editor,
             note: None,
         };
         append_jsonl_record(&p_dir.join("history").join("operations.jsonl"), &op)?;
-        self.append_audit(AuditAppendInput {
-            actor,
-            operation: "workspace_save_file",
-            purpose: "edit_preview",
-            project_id,
-            job_id: &op.event_id,
-            policy_version: "1.0.0",
-            classification: project.classification,
-            input_hash: before_hash.as_deref().unwrap_or(&new_hash),
-            output_hash: Some(&new_hash),
-            decision: AuditDecision::Allow,
-            reason_code: "FILE_SAVED",
-            error_code: None,
-            extra_keys: &[],
-        })?;
+
+        // Stage 6 (Finalize): remove staged file + commit journal, rebuild SQLite derived index
+        let _ = fs::remove_file(to_long_path(&staged_abs));
+        let _ = fs::remove_file(to_long_path(&journal_path));
         self.index.rebuild_from_canonical(&self.root)?;
         Ok(project)
     }
@@ -710,15 +777,40 @@ impl WorkspaceManager {
         }
 
         let base_rev = project.revision;
-        project.revision = base_rev.saturating_add(1);
+        let new_rev = base_rev.saturating_add(1);
         let now = Utc::now().to_rfc3339();
-        project.updated_at_utc = now.clone();
+        let agg_hash = sha256_hex(
+            serde_json::to_string(&changes)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
 
+        // Mandatory audit BEFORE modifying project config, history, or snapshot
+        self.append_audit(AuditAppendInput {
+            actor,
+            operation: "workspace_import_external_diff",
+            purpose: "edit_preview",
+            project_id,
+            job_id: &agg_hash,
+            policy_version: "1.0.0",
+            classification: project.classification,
+            input_hash: &agg_hash,
+            output_hash: Some(&agg_hash),
+            decision: AuditDecision::Allow,
+            reason_code: "EXTERNAL_CHANGE_IMPORTED",
+            error_code: None,
+            extra_keys: &[],
+        })?;
+
+        project.revision = new_rev;
+        project.updated_at_utc = now.clone();
         for ch in &changes {
             match &ch.after_hash {
                 Some(h) => {
                     let abs = p_dir.join(&ch.rel_path);
-                    let len = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+                    let len = fs::metadata(to_long_path(&abs))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     project.tracked_files.insert(
                         ch.rel_path.clone(),
                         FileFingerprint {
@@ -740,7 +832,7 @@ impl WorkspaceManager {
                 before_hash: ch.before_hash.clone(),
                 after_hash: ch.after_hash.clone(),
                 base_revision: base_rev,
-                new_revision: project.revision,
+                new_revision: new_rev,
                 origin_type: OriginType::ExternalDiff,
                 note: Some(
                     "observed_external_hash_diff_only;unobserved_edits_and_reasons_not_fabricated"
@@ -759,26 +851,6 @@ impl WorkspaceManager {
             Some("external_diff_imported".to_string()),
             SnapshotStatus::Complete,
         )?;
-        let agg_hash = sha256_hex(
-            serde_json::to_string(&changes)
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        self.append_audit(AuditAppendInput {
-            actor,
-            operation: "workspace_import_external_diff",
-            purpose: "edit_preview",
-            project_id,
-            job_id: &snap.snapshot_id,
-            policy_version: "1.0.0",
-            classification: project.classification,
-            input_hash: &agg_hash,
-            output_hash: Some(&agg_hash),
-            decision: AuditDecision::Allow,
-            reason_code: "EXTERNAL_CHANGE_IMPORTED",
-            error_code: None,
-            extra_keys: &[],
-        })?;
         self.index.rebuild_from_canonical(&self.root)?;
 
         Ok(ExternalChangeReport {
@@ -798,6 +870,22 @@ impl WorkspaceManager {
         let p_dir = self.project_dir(project_id)?;
         let _lock = ProjectLockGuard::acquire(&p_dir)?;
         let project = self.load_project(project_id)?;
+        let rev_hash = sha256_hex(format!("{project_id}:{}", project.revision).as_bytes());
+        self.append_audit(AuditAppendInput {
+            actor,
+            operation: "workspace_create_snapshot",
+            purpose: "edit_preview",
+            project_id,
+            job_id: &project.project_id,
+            policy_version: "1.0.0",
+            classification: project.classification,
+            input_hash: &rev_hash,
+            output_hash: Some(&rev_hash),
+            decision: AuditDecision::Allow,
+            reason_code: "SNAPSHOT_CREATED",
+            error_code: None,
+            extra_keys: &[],
+        })?;
         let snap = create_snapshot(
             &p_dir,
             &p_dir.join("history").join("snapshots"),
@@ -806,22 +894,6 @@ impl WorkspaceManager {
             reason,
             SnapshotStatus::Complete,
         )?;
-        let digest = sha256_hex(snap.snapshot_id.as_bytes());
-        self.append_audit(AuditAppendInput {
-            actor,
-            operation: "workspace_create_snapshot",
-            purpose: "edit_preview",
-            project_id,
-            job_id: &snap.snapshot_id,
-            policy_version: "1.0.0",
-            classification: project.classification,
-            input_hash: &digest,
-            output_hash: Some(&digest),
-            decision: AuditDecision::Allow,
-            reason_code: "SNAPSHOT_CREATED",
-            error_code: None,
-            extra_keys: &[],
-        })?;
         self.index.rebuild_from_canonical(&self.root)?;
         Ok(snap)
     }
@@ -837,6 +909,25 @@ impl WorkspaceManager {
         let mut project = self.load_project(project_id)?;
         let snaps_dir = p_dir.join("history").join("snapshots");
 
+        // Verify target snapshot integrity and record mandatory audit BEFORE modifying canonical files
+        let restored_manifest = lecture_studio_history::verify_snapshot(&snaps_dir, snapshot_id)?;
+        let h = sha256_hex(snapshot_id.as_bytes());
+        self.append_audit(AuditAppendInput {
+            actor,
+            operation: "workspace_restore_snapshot",
+            purpose: "edit_preview",
+            project_id,
+            job_id: snapshot_id,
+            policy_version: "1.0.0",
+            classification: project.classification,
+            input_hash: &h,
+            output_hash: Some(&h),
+            decision: AuditDecision::Allow,
+            reason_code: "SNAPSHOT_RESTORED",
+            error_code: None,
+            extra_keys: &[],
+        })?;
+
         let report = restore_snapshot(
             &p_dir,
             &snaps_dir,
@@ -844,7 +935,6 @@ impl WorkspaceManager {
             project.revision,
             snapshot_id,
         )?;
-        let restored_manifest = lecture_studio_history::verify_snapshot(&snaps_dir, snapshot_id)?;
 
         let base_rev = project.revision;
         project.revision = base_rev.saturating_add(1);
@@ -882,22 +972,6 @@ impl WorkspaceManager {
             )),
         };
         append_jsonl_record(&p_dir.join("history").join("operations.jsonl"), &op)?;
-        let h = sha256_hex(snapshot_id.as_bytes());
-        self.append_audit(AuditAppendInput {
-            actor,
-            operation: "workspace_restore_snapshot",
-            purpose: "edit_preview",
-            project_id,
-            job_id: snapshot_id,
-            policy_version: "1.0.0",
-            classification: project.classification,
-            input_hash: &h,
-            output_hash: Some(&h),
-            decision: AuditDecision::Allow,
-            reason_code: "SNAPSHOT_RESTORED",
-            error_code: None,
-            extra_keys: &[],
-        })?;
         self.index.rebuild_from_canonical(&self.root)?;
         Ok((project, report))
     }
@@ -1200,6 +1274,138 @@ impl WorkspaceManager {
         Ok(task)
     }
 
+    fn reconcile_project_commit_journal(
+        &self,
+        p_dir: &Path,
+        project_id: &str,
+        rolled_back: &mut usize,
+        rolled_forward: &mut usize,
+        removed_temps: &mut usize,
+    ) -> Result<(), WorkspaceError> {
+        let journal_path = p_dir.join("history").join(".commit_journal.json");
+        let ext_journal = to_long_path(&journal_path);
+        if !ext_journal.exists() {
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&ext_journal)
+            .map_err(|e| WorkspaceError::new("JOURNAL_READ_ERROR", e.to_string()))?;
+        let journal: CommitJournal = serde_json::from_str(&raw)
+            .map_err(|e| WorkspaceError::new("JOURNAL_CORRUPT", e.to_string()))?;
+        if journal.project_id != project_id {
+            return Err(WorkspaceError::new(
+                "JOURNAL_CORRUPT",
+                format!(
+                    "commit journal project_id={} does not match directory {}",
+                    journal.project_id, project_id
+                ),
+            ));
+        }
+
+        let staged_pb = validate_relative_path(&journal.staged_temp_rel_path)?;
+        let staged_norm = staged_pb.to_string_lossy().replace('\\', "/");
+        if !staged_norm.starts_with("history/.ls-stage-") {
+            return Err(WorkspaceError::new(
+                "JOURNAL_CORRUPT",
+                format!(
+                    "invalid app staged temp path: {}",
+                    journal.staged_temp_rel_path
+                ),
+            ));
+        }
+        let staged_abs = p_dir.join(&staged_pb);
+        ensure_no_symlink_in_path(&staged_abs)?;
+        let ext_staged = to_long_path(&staged_abs);
+
+        match journal.phase {
+            CommitPhase::Prepared => {
+                // Crashed before mandatory audit completed: roll back safely without modifying canonical files.
+                if ext_staged.exists() && fs::remove_file(&ext_staged).is_ok() {
+                    *removed_temps += 1;
+                }
+                fs::remove_file(&ext_journal)
+                    .map_err(|e| WorkspaceError::new("JOURNAL_CLEANUP_FAILED", e.to_string()))?;
+                *rolled_back += 1;
+            }
+            CommitPhase::Audited => {
+                // Audited commit point reached: idempotently finish applying canonical file, project.yaml, and history.
+                let (norm_target, target_rel_pb) =
+                    ensure_canonical_content_rel_path(&journal.target_rel_path)?;
+                let target_abs = p_dir.join(&target_rel_pb);
+                ensure_no_symlink_in_path(&target_abs)?;
+                let ext_target = to_long_path(&target_abs);
+
+                let target_needs_write = match fs::read(&ext_target) {
+                    Ok(existing) => sha256_hex(&existing) != journal.after_hash,
+                    Err(_) => true,
+                };
+                if target_needs_write {
+                    let staged_bytes = fs::read(&ext_staged).map_err(|e| {
+                        WorkspaceError::new(
+                            "JOURNAL_RECOVERY_FAILED",
+                            format!("missing staged payload for audited journal: {e}"),
+                        )
+                    })?;
+                    if sha256_hex(&staged_bytes) != journal.after_hash {
+                        return Err(WorkspaceError::new(
+                            "JOURNAL_CORRUPT",
+                            "staged payload hash mismatch during roll-forward recovery.",
+                        ));
+                    }
+                    atomic_promote(&staged_bytes, &target_abs)?;
+                }
+
+                let mut project = self.load_project(project_id)?;
+                let proj_needs_update = project.revision < journal.target_revision
+                    || project
+                        .tracked_files
+                        .get(&norm_target)
+                        .is_none_or(|f| f.sha256 != journal.after_hash);
+                if proj_needs_update {
+                    project.revision = project.revision.max(journal.target_revision);
+                    project.updated_at_utc = journal.timestamp_utc.clone();
+                    project.tracked_files.insert(
+                        norm_target.clone(),
+                        FileFingerprint {
+                            sha256: journal.after_hash.clone(),
+                            size_bytes: journal.after_size_bytes,
+                        },
+                    );
+                    self.save_project_config(&project)?;
+                }
+
+                let ops_path = p_dir.join("history").join("operations.jsonl");
+                let existing_ops = read_jsonl_strict::<OperationRecord>(&ops_path)?;
+                if !existing_ops
+                    .iter()
+                    .any(|op| op.event_id == journal.op_event_id)
+                {
+                    let op = OperationRecord {
+                        schema_version: CURRENT_HISTORY_SCHEMA_VERSION.to_string(),
+                        event_id: journal.op_event_id.clone(),
+                        timestamp_utc: journal.timestamp_utc.clone(),
+                        actor: journal.actor.clone(),
+                        target_path: norm_target,
+                        before_hash: journal.before_hash.clone(),
+                        after_hash: Some(journal.after_hash.clone()),
+                        base_revision: journal.base_revision,
+                        new_revision: journal.target_revision,
+                        origin_type: OriginType::Editor,
+                        note: Some("recovered_from_audited_commit_journal".to_string()),
+                    };
+                    append_jsonl_record(&ops_path, &op)?;
+                }
+
+                if ext_staged.exists() && fs::remove_file(&ext_staged).is_ok() {
+                    *removed_temps += 1;
+                }
+                fs::remove_file(&ext_journal)
+                    .map_err(|e| WorkspaceError::new("JOURNAL_CLEANUP_FAILED", e.to_string()))?;
+                *rolled_forward += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn recover_workspace(&self) -> Result<RecoveryReport, WorkspaceError> {
         let (_, audit_sidecar) = self.audit_log.recover_truncated_tail()?;
         let audit_dropped = usize::from(audit_sidecar.is_some());
@@ -1211,6 +1417,11 @@ impl WorkspaceManager {
         )?;
 
         let mut proj_hist_dropped = 0usize;
+        let mut rolled_back_journals = 0usize;
+        let mut rolled_forward_journals = 0usize;
+        let mut skipped_locked_projects = 0usize;
+        let mut removed_orphan_temps = 0usize;
+
         let projects_dir = self.root.join("projects");
         if projects_dir.exists() {
             for entry in fs::read_dir(&projects_dir)
@@ -1221,6 +1432,16 @@ impl WorkspaceManager {
                 if !p_dir.is_dir() {
                     continue;
                 }
+                let proj_id = entry.file_name().to_string_lossy().into_owned();
+                let lock = match ProjectLockGuard::acquire(&p_dir) {
+                    Ok(g) => g,
+                    Err(e) if e.code() == "LOCK_CONTENTION" => {
+                        skipped_locked_projects += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+
                 let op_rep = recover_jsonl_tail::<OperationRecord>(
                     &p_dir.join("history").join("operations.jsonl"),
                 )?;
@@ -1228,10 +1449,19 @@ impl WorkspaceManager {
                     &p_dir.join("history").join("decisions.jsonl"),
                 )?;
                 proj_hist_dropped += op_rep.dropped_tail_lines + dec_rep.dropped_tail_lines;
+
+                self.reconcile_project_commit_journal(
+                    &p_dir,
+                    &proj_id,
+                    &mut rolled_back_journals,
+                    &mut rolled_forward_journals,
+                    &mut removed_orphan_temps,
+                )?;
+                drop(lock);
             }
         }
 
-        let removed_orphan_temps = cleanup_orphan_temp_files(&self.root)?;
+        removed_orphan_temps += self.index.cleanup_recorded_index_temp()?;
         let need_rebuild = !self.index.verify_integrity()?;
         let stats = self.index.rebuild_from_canonical(&self.root)?;
 
@@ -1241,38 +1471,12 @@ impl WorkspaceManager {
             sources_dropped_lines: sources_rep.dropped_tail_lines,
             exchange_keys_dropped_lines: keys_rep.dropped_tail_lines,
             project_history_dropped_lines: proj_hist_dropped,
+            rolled_back_journals,
+            rolled_forward_journals,
+            skipped_locked_projects,
             removed_orphan_temps,
             index_rebuilt: need_rebuild,
             index_stats: stats,
         })
     }
-}
-
-fn cleanup_orphan_temp_files(root: &Path) -> Result<usize, WorkspaceError> {
-    let mut removed = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&p) else {
-                continue;
-            };
-            if meta.file_type().is_dir() {
-                stack.push(p);
-            } else if meta.file_type().is_file() {
-                let name = entry.file_name();
-                let name_s = name.to_string_lossy();
-                if name_s.starts_with('.')
-                    && name_s.ends_with(".tmp")
-                    && fs::remove_file(&p).is_ok()
-                {
-                    removed += 1;
-                }
-            }
-        }
-    }
-    Ok(removed)
 }

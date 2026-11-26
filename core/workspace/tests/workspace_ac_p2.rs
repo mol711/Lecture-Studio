@@ -3,13 +3,14 @@ use std::io::Write;
 
 use chrono::{Duration, Utc};
 use lecture_studio_history::{
-    ConsentPurpose, DecisionOutcome, SnapshotManifest, SnapshotStatus,
-    CURRENT_HISTORY_SCHEMA_VERSION,
+    read_jsonl_strict, ConsentPurpose, DecisionOutcome, OperationRecord, SnapshotManifest,
+    SnapshotStatus, CURRENT_HISTORY_SCHEMA_VERSION,
 };
 use lecture_studio_security::DataClassification;
 use lecture_studio_workspace::{
-    ExchangeTask, ExchangeTaskStatus, ExternalChangeKind, ProjectLockGuard, ProjectMode,
-    SourcePermissions, WorkspaceManager, WorkspaceSqliteIndex, CURRENT_WORKSPACE_SCHEMA_VERSION,
+    CommitJournal, CommitPhase, ExchangeTask, ExchangeTaskStatus, ExternalChangeKind,
+    ProjectLockGuard, ProjectMode, SourcePermissions, WorkspaceManager, WorkspaceSqliteIndex,
+    CURRENT_WORKSPACE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -338,7 +339,7 @@ fn workspace_ac_p2_full_lifecycle_recovery_and_exchange() {
         .verify_integrity()
         .unwrap());
 
-    // Simulate crash-truncated JSONL tails and orphan temp file
+    // Simulate crash-truncated JSONL tail, while user's hidden .tmp file MUST remain untouched
     {
         let mut fh = fs::OpenOptions::new()
             .append(true)
@@ -350,11 +351,16 @@ fn workspace_ac_p2_full_lifecycle_recovery_and_exchange() {
             .unwrap();
         writeln!(fh, "{{\"truncated_crash\": ").unwrap();
     }
-    fs::write(ws_root.join("projects").join(".orphan.tmp"), b"temp").unwrap();
+    let user_tmp = ws
+        .project_dir(&proj.project_id)
+        .unwrap()
+        .join("assets/.user-data.tmp");
+    fs::write(&user_tmp, b"USER_DATA_MUST_SURVIVE").unwrap();
 
     let rec = ws_reopened.recover_workspace().unwrap();
     assert_eq!(rec.project_history_dropped_lines, 1);
-    assert_eq!(rec.removed_orphan_temps, 1);
+    assert_eq!(rec.removed_orphan_temps, 0);
+    assert_eq!(fs::read(&user_tmp).unwrap(), b"USER_DATA_MUST_SURVIVE");
     assert!(rec.index_rebuilt);
     assert!(ws_reopened.sqlite_index().verify_integrity().unwrap());
     assert!(!ws_reopened
@@ -385,4 +391,442 @@ fn workspace_ac_p2_full_lifecycle_recovery_and_exchange() {
     assert_eq!(incompat_err.code(), "SCHEMA_VERSION_INCOMPATIBLE");
     // Double-check CURRENT_HISTORY_SCHEMA_VERSION constant used cleanly
     assert_eq!(CURRENT_HISTORY_SCHEMA_VERSION, "1.0.0");
+}
+
+fn setup_basic_workspace() -> (TempDir, WorkspaceManager, String) {
+    let tmp = TempDir::new().unwrap();
+    let ws_root = tmp.path().join("ws");
+    let in_r = tmp.path().join("in");
+    let out_r = tmp.path().join("out");
+    fs::create_dir_all(&in_r).unwrap();
+    fs::create_dir_all(&out_r).unwrap();
+    let ws = WorkspaceManager::init_workspace(&ws_root, vec![in_r], vec![out_r]).unwrap();
+    let proj = ws
+        .create_project(
+            "Safety Test Project",
+            ProjectMode::LatexFirst,
+            "latex/main.tex",
+            b"\\section{Initial v1}\n",
+            DataClassification::Internal,
+            "cli_user",
+        )
+        .unwrap();
+    (tmp, ws, proj.project_id)
+}
+
+#[test]
+fn recover_workspace_preserves_user_hidden_tmp_files_and_skips_active_locked_projects() {
+    let (_tmp, ws, pid) = setup_basic_workspace();
+    let p_dir = ws.project_dir(&pid).unwrap();
+
+    // User's own hidden .tmp files in assets/ and latex/ MUST never be deleted by recover_workspace
+    let user_asset_tmp = p_dir.join("assets/.user-data.tmp");
+    let user_latex_tmp = p_dir.join("latex/.notes.tmp");
+    fs::write(&user_asset_tmp, b"IMPORTANT_USER_TEMP").unwrap();
+    fs::write(&user_latex_tmp, b"IMPORTANT_LATEX_TEMP").unwrap();
+
+    // While a live OS lock is held (simulating active save), recover_workspace skips the locked project
+    let active_staged = p_dir.join("history/.ls-stage-active.tmp");
+    fs::write(&active_staged, b"ACTIVE_SAVE_IN_PROGRESS").unwrap();
+    let active_journal = CommitJournal {
+        schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+        tx_id: "active".to_string(),
+        project_id: pid.clone(),
+        target_rel_path: "latex/main.tex".to_string(),
+        base_revision: 1,
+        target_revision: 2,
+        before_hash: Some(sha256_hex(b"\\section{Initial v1}\n")),
+        after_hash: sha256_hex(b"ACTIVE_SAVE_IN_PROGRESS"),
+        after_size_bytes: 23,
+        actor: "cli_user".to_string(),
+        op_event_id: "op-active".to_string(),
+        timestamp_utc: Utc::now().to_rfc3339(),
+        staged_temp_rel_path: "history/.ls-stage-active.tmp".to_string(),
+        audit_id: None,
+        phase: CommitPhase::Prepared,
+    };
+    fs::write(
+        p_dir.join("history/.commit_journal.json"),
+        serde_json::to_string_pretty(&active_journal).unwrap(),
+    )
+    .unwrap();
+
+    {
+        let _active_lock = ProjectLockGuard::acquire(&p_dir).unwrap();
+        let rep_locked = ws.recover_workspace().unwrap();
+        assert_eq!(rep_locked.skipped_locked_projects, 1);
+        assert_eq!(rep_locked.rolled_back_journals, 0);
+        assert!(active_staged.exists());
+    }
+
+    // Once active lock is released, recovery rolls back the Prepared app journal & cleans ONLY its temp
+    let rep_unlocked = ws.recover_workspace().unwrap();
+    assert_eq!(rep_unlocked.skipped_locked_projects, 0);
+    assert_eq!(rep_unlocked.rolled_back_journals, 1);
+    assert_eq!(rep_unlocked.removed_orphan_temps, 1);
+    assert!(!active_staged.exists());
+    assert!(!p_dir.join("history/.commit_journal.json").exists());
+    assert_eq!(fs::read(&user_asset_tmp).unwrap(), b"IMPORTANT_USER_TEMP");
+    assert_eq!(fs::read(&user_latex_tmp).unwrap(), b"IMPORTANT_LATEX_TEMP");
+}
+
+#[test]
+fn stale_lock_file_from_dead_pid_recovers_automatically_while_live_lock_contends() {
+    let (_tmp, ws, pid) = setup_basic_workspace();
+    let p_dir = ws.project_dir(&pid).unwrap();
+    let lock_path = p_dir.join(".project.lock");
+
+    // Simulate process crash leaving behind a stale lock file referencing a non-existent PID
+    fs::write(&lock_path, b"pid=999999\n").unwrap();
+
+    let rep = ws.recover_workspace().unwrap();
+    assert_eq!(rep.skipped_locked_projects, 0);
+
+    let saved = ws
+        .save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{After Dead Lock}\n",
+            1,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+    assert_eq!(saved.revision, 2);
+
+    // Live held OS lock MUST still enforce LOCK_CONTENTION
+    let _live = ProjectLockGuard::acquire(&p_dir).unwrap();
+    let err = ws
+        .save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{Should Contend}\n",
+            2,
+            None,
+            "cli_user",
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "LOCK_CONTENTION");
+}
+
+#[test]
+fn audit_failure_leaves_canonical_file_revision_and_history_unchanged() {
+    let (tmp, ws, pid) = setup_basic_workspace();
+    let p_dir = ws.project_dir(&pid).unwrap();
+    let main_abs = p_dir.join("latex/main.tex");
+    let audit_path = ws.audit_log().path().to_path_buf();
+    let ops_path = p_dir.join("history/operations.jsonl");
+
+    let ops_before = read_jsonl_strict::<OperationRecord>(&ops_path)
+        .unwrap()
+        .len();
+    let rev_before = ws.load_project(&pid).unwrap().revision;
+    let content_before = fs::read(&main_abs).unwrap();
+
+    // Make audit log unwritable (read-only) so mandatory audit fails
+    let mut perms = fs::metadata(&audit_path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&audit_path, perms).unwrap();
+
+    let err_save = ws
+        .save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{MUST_NOT_COMMIT}\n",
+            rev_before,
+            None,
+            "cli_user",
+        )
+        .unwrap_err();
+    assert_eq!(err_save.code(), "AUDIT_FAILURE");
+
+    // Canonical source, project revision, and operation history must remain 100% unchanged
+    assert_eq!(fs::read(&main_abs).unwrap(), content_before);
+    assert_eq!(ws.load_project(&pid).unwrap().revision, rev_before);
+    assert_eq!(
+        read_jsonl_strict::<OperationRecord>(&ops_path)
+            .unwrap()
+            .len(),
+        ops_before
+    );
+    assert!(!p_dir.join("history/.commit_journal.json").exists());
+
+    // Export must also abort before writing to destination when audit log is unwritable
+    let out_file = tmp.path().join("out/must_not_export.tex");
+    let err_export = ws
+        .export_project_file(&pid, "latex/main.tex", &out_file, "cli_user")
+        .unwrap_err();
+    assert_eq!(err_export.code(), "AUDIT_FAILURE");
+    assert!(!out_file.exists());
+
+    // Restore audit log writability and confirm subsequent save succeeds cleanly
+    let mut perms_rw = fs::metadata(&audit_path).unwrap().permissions();
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms_rw.set_readonly(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms_rw.set_mode(0o644);
+    }
+    fs::set_permissions(&audit_path, perms_rw).unwrap();
+
+    let saved = ws
+        .save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{Recovered Clean Save}\n",
+            rev_before,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+    assert_eq!(saved.revision, rev_before + 1);
+}
+
+#[test]
+fn commit_journal_recovers_mid_save_crashes_at_every_stage() {
+    let (_tmp, ws, pid) = setup_basic_workspace();
+    let p_dir = ws.project_dir(&pid).unwrap();
+    let main_abs = p_dir.join("latex/main.tex");
+    let ops_path = p_dir.join("history/operations.jsonl");
+    let journal_path = p_dir.join("history/.commit_journal.json");
+
+    // Stage A: crash during Prepared phase (before audit) -> rollback leaves v1 untouched
+    let staged_a_rel = "history/.ls-stage-crashA.tmp";
+    fs::write(
+        p_dir.join(staged_a_rel),
+        b"\\section{Uncommitted Crash A}\n",
+    )
+    .unwrap();
+    let j_a = CommitJournal {
+        schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+        tx_id: "crashA".to_string(),
+        project_id: pid.clone(),
+        target_rel_path: "latex/main.tex".to_string(),
+        base_revision: 1,
+        target_revision: 2,
+        before_hash: Some(sha256_hex(b"\\section{Initial v1}\n")),
+        after_hash: sha256_hex(b"\\section{Uncommitted Crash A}\n"),
+        after_size_bytes: 29,
+        actor: "cli_user".to_string(),
+        op_event_id: "op-crash-a".to_string(),
+        timestamp_utc: Utc::now().to_rfc3339(),
+        staged_temp_rel_path: staged_a_rel.to_string(),
+        audit_id: None,
+        phase: CommitPhase::Prepared,
+    };
+    fs::write(&journal_path, serde_json::to_string_pretty(&j_a).unwrap()).unwrap();
+    assert_eq!(
+        ws.save_project_file(&pid, "latex/main.tex", b"BLOCKED", 1, None, "cli_user")
+            .unwrap_err()
+            .code(),
+        "RECOVERY_REQUIRED"
+    );
+
+    let rep_a = ws.recover_workspace().unwrap();
+    assert_eq!(rep_a.rolled_back_journals, 1);
+    assert_eq!(rep_a.rolled_forward_journals, 0);
+    assert_eq!(fs::read(&main_abs).unwrap(), b"\\section{Initial v1}\n");
+    assert_eq!(ws.load_project(&pid).unwrap().revision, 1);
+    assert!(!journal_path.exists());
+
+    // Stage B: Audited crash AFTER canonical file write, BEFORE project.yaml and operations.jsonl update
+    let rev2_bytes = b"\\section{Committed Via Journal B}\n";
+    let staged_b_rel = "history/.ls-stage-crashB.tmp";
+    fs::write(p_dir.join(staged_b_rel), rev2_bytes).unwrap();
+    fs::write(&main_abs, rev2_bytes).unwrap();
+    let j_b = CommitJournal {
+        schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+        tx_id: "crashB".to_string(),
+        project_id: pid.clone(),
+        target_rel_path: "latex/main.tex".to_string(),
+        base_revision: 1,
+        target_revision: 2,
+        before_hash: Some(sha256_hex(b"\\section{Initial v1}\n")),
+        after_hash: sha256_hex(rev2_bytes),
+        after_size_bytes: rev2_bytes.len() as u64,
+        actor: "cli_user".to_string(),
+        op_event_id: "op-crash-b".to_string(),
+        timestamp_utc: Utc::now().to_rfc3339(),
+        staged_temp_rel_path: staged_b_rel.to_string(),
+        audit_id: Some("aud-b".to_string()),
+        phase: CommitPhase::Audited,
+    };
+    fs::write(&journal_path, serde_json::to_string_pretty(&j_b).unwrap()).unwrap();
+
+    let rep_b = ws.recover_workspace().unwrap();
+    assert_eq!(rep_b.rolled_forward_journals, 1);
+    assert_eq!(ws.load_project(&pid).unwrap().revision, 2);
+    assert_eq!(fs::read(&main_abs).unwrap(), rev2_bytes);
+    let ops_b = read_jsonl_strict::<OperationRecord>(&ops_path).unwrap();
+    assert!(ops_b.iter().any(|op| op.event_id == "op-crash-b"));
+
+    // Stage C: Audited crash AFTER project.yaml update, BEFORE operations.jsonl append
+    let rev3_bytes = b"\\section{Committed Via Journal C}\n";
+    let staged_c_rel = "history/.ls-stage-crashC.tmp";
+    fs::write(p_dir.join(staged_c_rel), rev3_bytes).unwrap();
+    fs::write(&main_abs, rev3_bytes).unwrap();
+    let mut proj_c = ws.load_project(&pid).unwrap();
+    proj_c.revision = 3;
+    proj_c
+        .tracked_files
+        .get_mut("latex/main.tex")
+        .unwrap()
+        .sha256 = sha256_hex(rev3_bytes);
+    fs::write(
+        p_dir.join("project.yaml"),
+        serde_yaml::to_string(&proj_c).unwrap(),
+    )
+    .unwrap();
+    let j_c = CommitJournal {
+        schema_version: CURRENT_WORKSPACE_SCHEMA_VERSION.to_string(),
+        tx_id: "crashC".to_string(),
+        project_id: pid.clone(),
+        target_rel_path: "latex/main.tex".to_string(),
+        base_revision: 2,
+        target_revision: 3,
+        before_hash: Some(sha256_hex(rev2_bytes)),
+        after_hash: sha256_hex(rev3_bytes),
+        after_size_bytes: rev3_bytes.len() as u64,
+        actor: "cli_user".to_string(),
+        op_event_id: "op-crash-c".to_string(),
+        timestamp_utc: Utc::now().to_rfc3339(),
+        staged_temp_rel_path: staged_c_rel.to_string(),
+        audit_id: Some("aud-c".to_string()),
+        phase: CommitPhase::Audited,
+    };
+    fs::write(&journal_path, serde_json::to_string_pretty(&j_c).unwrap()).unwrap();
+
+    let rep_c1 = ws.recover_workspace().unwrap();
+    assert_eq!(rep_c1.rolled_forward_journals, 1);
+    let ops_c = read_jsonl_strict::<OperationRecord>(&ops_path).unwrap();
+    assert_eq!(
+        ops_c
+            .iter()
+            .filter(|op| op.event_id == "op-crash-c")
+            .count(),
+        1
+    );
+    // Re-running recover_workspace must be completely idempotent
+    let rep_c2 = ws.recover_workspace().unwrap();
+    assert_eq!(rep_c2.rolled_forward_journals, 0);
+    let ops_c2 = read_jsonl_strict::<OperationRecord>(&ops_path).unwrap();
+    assert_eq!(
+        ops_c2
+            .iter()
+            .filter(|op| op.event_id == "op-crash-c")
+            .count(),
+        1
+    );
+
+    // Next save at revision 3 works seamlessly
+    let saved4 = ws
+        .save_project_file(
+            &pid,
+            "latex/main.tex",
+            b"\\section{Rev 4}\n",
+            3,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+    assert_eq!(saved4.revision, 4);
+}
+
+#[test]
+fn workspace_and_snapshots_work_on_normal_and_deep_temp_paths() {
+    // 1. Standard non-extended temp path directly under std::env::temp_dir()
+    let normal_base =
+        std::env::temp_dir().join(format!("ls_norm_{}", uuid::Uuid::new_v4().simple()));
+    let _cleanup_guard = tempfile::Builder::new()
+        .prefix("ls_guard_")
+        .tempdir()
+        .unwrap();
+    let ws_norm = normal_base.join("workspace");
+    let in_norm = normal_base.join("in");
+    let out_norm = normal_base.join("out");
+    fs::create_dir_all(&in_norm).unwrap();
+    fs::create_dir_all(&out_norm).unwrap();
+
+    let mgr = WorkspaceManager::init_workspace(&ws_norm, vec![in_norm], vec![out_norm]).unwrap();
+    let proj = mgr
+        .create_project(
+            "Normal Path Test",
+            ProjectMode::TypstFirst,
+            "typst/main.typ",
+            b"= Normal Path Typst\n",
+            DataClassification::Public,
+            "cli_user",
+        )
+        .unwrap();
+    let saved = mgr
+        .save_project_file(
+            &proj.project_id,
+            "typst/main.typ",
+            b"= Updated Typst Rev2\n",
+            1,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+    let snap = mgr
+        .create_project_snapshot(
+            &proj.project_id,
+            Some("normal-temp-snap".to_string()),
+            "cli_user",
+        )
+        .unwrap();
+    let (restored, _) = mgr
+        .restore_project_snapshot(&proj.project_id, &snap.snapshot_id, "cli_user")
+        .unwrap();
+    assert_eq!(saved.revision, 2);
+    assert_eq!(restored.revision, 3);
+    let _ = fs::remove_dir_all(&normal_base);
+
+    // 2. Deep >260-char workspace root path on Windows
+    let tmp = TempDir::new().unwrap();
+    let deep_root = tmp
+        .path()
+        .join("deep_a".repeat(12))
+        .join("deep_b".repeat(12))
+        .join("LectureWorkspace");
+    let deep_in = tmp.path().join("in");
+    let deep_out = tmp.path().join("out");
+    fs::create_dir_all(&deep_in).unwrap();
+    fs::create_dir_all(&deep_out).unwrap();
+    assert!(deep_root.to_string_lossy().len() > 160);
+
+    let deep_mgr =
+        WorkspaceManager::init_workspace(&deep_root, vec![deep_in], vec![deep_out]).unwrap();
+    let deep_proj = deep_mgr
+        .create_project(
+            "Deep Path Project",
+            ProjectMode::LatexFirst,
+            "latex/section_deep/main_file_exceeding_legacy_max_path_limits.tex",
+            b"\\section{Deep Path Content}\n",
+            DataClassification::Internal,
+            "cli_user",
+        )
+        .unwrap();
+    assert!(
+        deep_mgr
+            .project_dir(&deep_proj.project_id)
+            .unwrap()
+            .join("history/snapshots/blobs")
+            .to_string_lossy()
+            .len()
+            > 250
+    );
+    let deep_saved = deep_mgr
+        .save_project_file(
+            &deep_proj.project_id,
+            "latex/section_deep/main_file_exceeding_legacy_max_path_limits.tex",
+            b"\\section{Deep Updated}\n",
+            1,
+            None,
+            "cli_user",
+        )
+        .unwrap();
+    assert_eq!(deep_saved.revision, 2);
 }

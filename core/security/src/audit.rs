@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::errors::SecurityError;
 use crate::models::{AuditDecision, AuditRecord, DataClassification};
+use crate::staging::to_long_path;
 
 const FORBIDDEN_METADATA_KEYS: &[&str] = &[
     "prompt",
@@ -107,10 +108,11 @@ impl HashChainedAuditLog {
     }
 
     fn last_hash(&self) -> Result<String, SecurityError> {
-        if !self.log_path.exists() {
+        let ext = to_long_path(&self.log_path);
+        if !ext.exists() {
             return Ok("0".repeat(64));
         }
-        let raw = fs::read_to_string(&self.log_path).map_err(|e| SecurityError::AuditFailure {
+        let raw = fs::read_to_string(&ext).map_err(|e| SecurityError::AuditFailure {
             user_message: "Failed to read audit log tail (fail-closed).".to_string(),
             detail: e.to_string(),
         })?;
@@ -164,7 +166,8 @@ impl HashChainedAuditLog {
         };
         record.entry_hash = canonical_record_hash(&record)?;
 
-        if let Some(parent) = self.log_path.parent() {
+        let ext = to_long_path(&self.log_path);
+        if let Some(parent) = ext.parent() {
             fs::create_dir_all(parent).map_err(|e| SecurityError::AuditFailure {
                 user_message: "Failed to create audit directory (fail-closed).".to_string(),
                 detail: e.to_string(),
@@ -179,7 +182,7 @@ impl HashChainedAuditLog {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.log_path)
+            .open(&ext)
             .map_err(|e| SecurityError::AuditFailure {
                 user_message: "Failed to open audit log for append (fail-closed).".to_string(),
                 detail: e.to_string(),

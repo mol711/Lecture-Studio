@@ -8,7 +8,7 @@
     "uv": "uv 0.13.9 (6b2d39dcc 2026-11-17 x86_64-pc-windows-msvc)"
   },
   "lockfiles": {
-    "Cargo.lock_sha256": "898fde05be0db96d3aaf9b1d78ff410963fb1e951567ef05ebe186ddd9c11dbf",
+    "Cargo.lock_sha256": "7dfe220a0bcfc5eab24a8ec89fcef8cf48b538b526621b582052dc253e74369b",
     "uv.lock_sha256": "45cbb2de28b85bc27963a6f0167b182bc43aac849c86ca035888cee3c2836789"
   },
   "rust_crates": [

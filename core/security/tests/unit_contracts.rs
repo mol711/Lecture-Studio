@@ -644,3 +644,27 @@ fn staging_purge_failure_records_remaining_bytes_and_blocks_reuse() {
         let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
     }
 }
+
+#[test]
+fn atomic_promote_handles_normal_and_deep_paths_over_max_path() {
+    let tmp = TempDir::new().unwrap();
+    // Normal path atomic promotion
+    let normal_dst = tmp.path().join("normal_output.json");
+    atomic_promote(br#"{"ok":true}"#, &normal_dst).unwrap();
+    assert_eq!(fs::read(&normal_dst).unwrap(), br#"{"ok":true}"#);
+
+    // Deep nested path (> 270 chars) crossing Windows MAX_PATH
+    let deep_dir = tmp
+        .path()
+        .join("a".repeat(60))
+        .join("b".repeat(60))
+        .join("c".repeat(60))
+        .join("d".repeat(60));
+    let deep_dst = deep_dir.join(format!("{}.json", "x".repeat(64)));
+    assert!(deep_dst.to_string_lossy().len() > 260);
+    atomic_promote(br#"{"deep":true}"#, &deep_dst).unwrap();
+    assert_eq!(
+        fs::read(lecture_studio_security::staging::to_long_path(&deep_dst)).unwrap(),
+        br#"{"deep":true}"#
+    );
+}

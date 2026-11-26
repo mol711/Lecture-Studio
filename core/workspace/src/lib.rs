@@ -11,10 +11,10 @@ pub use errors::WorkspaceError;
 pub use lock::ProjectLockGuard;
 pub use manager::WorkspaceManager;
 pub use models::{
-    ExchangeTask, ExchangeTaskStatus, ExternalChangeKind, ExternalChangeReport, ExternalFileChange,
-    FileFingerprint, IndexRebuildStats, ProcessedExchangeKey, ProjectConfig, ProjectMode,
-    RecoveryReport, RetentionPolicy, SourcePermissions, SourceRecord, WorkspaceConfig,
-    CURRENT_WORKSPACE_SCHEMA_VERSION,
+    CommitJournal, CommitPhase, ExchangeTask, ExchangeTaskStatus, ExternalChangeKind,
+    ExternalChangeReport, ExternalFileChange, FileFingerprint, IndexRebuildStats,
+    ProcessedExchangeKey, ProjectConfig, ProjectMode, RecoveryReport, RetentionPolicy,
+    SourcePermissions, SourceRecord, WorkspaceConfig, CURRENT_WORKSPACE_SCHEMA_VERSION,
 };
 pub use path_guard::{
     ensure_no_symlink_in_path, resolve_without_symlinks, validate_relative_path,

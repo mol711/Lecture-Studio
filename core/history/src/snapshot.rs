@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
-use lecture_studio_security::staging::atomic_promote;
+use lecture_studio_security::staging::{atomic_promote, to_long_path};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -74,9 +74,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn collect_project_files(
     project_dir: &Path,
 ) -> Result<Vec<(String, PathBuf, Vec<u8>)>, HistoryError> {
+    let ext_project_dir = to_long_path(project_dir);
     let mut collected = Vec::new();
     for sub in CANONICAL_CONTENT_DIRS {
-        let base = project_dir.join(sub);
+        let base = ext_project_dir.join(sub);
         let Ok(base_meta) = fs::symlink_metadata(&base) else {
             continue;
         };
@@ -112,7 +113,7 @@ fn collect_project_files(
                     stack.push(p);
                 } else if meta.file_type().is_file() {
                     let rel = p
-                        .strip_prefix(project_dir)
+                        .strip_prefix(&ext_project_dir)
                         .map_err(|e| HistoryError::InvalidPath(e.to_string()))?
                         .to_string_lossy()
                         .replace('\\', "/");
@@ -137,7 +138,8 @@ pub fn create_snapshot(
     reason: Option<String>,
     creation_status: SnapshotStatus,
 ) -> Result<SnapshotManifest, HistoryError> {
-    let blobs_dir = snapshots_dir.join("blobs");
+    let ext_snapshots_dir = to_long_path(snapshots_dir);
+    let blobs_dir = ext_snapshots_dir.join("blobs");
     fs::create_dir_all(&blobs_dir).map_err(|e| HistoryError::Io {
         code: "SNAPSHOT_DIR_FAILED",
         message: format!("{}: {e}", blobs_dir.display()),
@@ -179,7 +181,7 @@ pub fn create_snapshot(
         reason,
     };
 
-    let manifest_path = snapshots_dir.join(format!("{snapshot_id}.json"));
+    let manifest_path = ext_snapshots_dir.join(format!("{snapshot_id}.json"));
     let serialized = serde_json::to_string_pretty(&manifest)
         .map_err(|e| HistoryError::JsonParse(e.to_string()))?;
     atomic_promote(serialized.as_bytes(), &manifest_path)?;
@@ -191,7 +193,8 @@ pub fn verify_snapshot(
     snapshot_id: &str,
 ) -> Result<SnapshotManifest, HistoryError> {
     validate_snapshot_id(snapshot_id)?;
-    let manifest_path = snapshots_dir.join(format!("{snapshot_id}.json"));
+    let ext_snapshots_dir = to_long_path(snapshots_dir);
+    let manifest_path = ext_snapshots_dir.join(format!("{snapshot_id}.json"));
     if !manifest_path.exists() {
         return Err(HistoryError::SnapshotNotFound(snapshot_id.to_string()));
     }
@@ -209,7 +212,7 @@ pub fn verify_snapshot(
         });
     }
 
-    let blobs_dir = snapshots_dir.join("blobs");
+    let blobs_dir = ext_snapshots_dir.join("blobs");
     for entry in &manifest.files {
         validate_rel_path(&entry.rel_path)?;
         let blob_path = blobs_dir.join(&entry.sha256);
@@ -259,8 +262,10 @@ pub fn restore_snapshot(
         SnapshotStatus::PreRestoreBackup,
     )?;
 
+    let ext_project_dir = to_long_path(project_dir);
+    let ext_snapshots_dir = to_long_path(snapshots_dir);
     let target_paths: HashSet<String> = target.files.iter().map(|f| f.rel_path.clone()).collect();
-    let current_files = collect_project_files(project_dir)?;
+    let current_files = collect_project_files(&ext_project_dir)?;
     for (rel_path, abs_path, _) in current_files {
         if !target_paths.contains(&rel_path) {
             fs::remove_file(&abs_path).map_err(|e| HistoryError::Io {
@@ -270,12 +275,12 @@ pub fn restore_snapshot(
         }
     }
 
-    let blobs_dir = snapshots_dir.join("blobs");
+    let blobs_dir = ext_snapshots_dir.join("blobs");
     for entry in &target.files {
         let rel_pb = validate_rel_path(&entry.rel_path)?;
         let blob_bytes = fs::read(blobs_dir.join(&entry.sha256))
             .map_err(|e| HistoryError::SnapshotCorrupted(format!("blob {}: {e}", entry.sha256)))?;
-        let dest = project_dir.join(rel_pb);
+        let dest = ext_project_dir.join(rel_pb);
         atomic_promote(&blob_bytes, &dest)?;
     }
 

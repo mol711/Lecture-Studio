@@ -834,8 +834,70 @@ pub fn quarantine_staging(
     Ok(q_dir)
 }
 
+/// Normalize a filesystem path into Windows extended-length (`\\?\`) form when applicable so
+/// normal temp paths and >260-char paths both work reliably across Win32 file APIs.
+#[must_use]
+pub fn to_long_path(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if raw.starts_with(r"\\?\") || raw.starts_with(r"\\.\") {
+            return path.to_path_buf();
+        }
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let mut stack: Vec<std::ffi::OsString> = Vec::new();
+        for comp in abs.components() {
+            match comp {
+                Component::Prefix(p) => stack.push(p.as_os_str().to_os_string()),
+                Component::RootDir => {
+                    if stack.is_empty() {
+                        stack.push(std::ffi::OsString::from(r"\"));
+                    }
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                }
+                Component::Normal(seg) => stack.push(seg.to_os_string()),
+            }
+        }
+        let mut norm = PathBuf::new();
+        for (idx, seg) in stack.into_iter().enumerate() {
+            if idx == 0 {
+                let s = seg.to_string_lossy();
+                if s.ends_with(':') {
+                    norm.push(format!(r"{s}\"));
+                } else {
+                    norm.push(seg);
+                }
+            } else {
+                norm.push(seg);
+            }
+        }
+        let s = norm.to_string_lossy();
+        if let Some(unc) = s.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{s}"))
+        }
+    }
+}
+
 pub fn atomic_promote(raw_bytes: &[u8], destination: &Path) -> Result<(), SecurityError> {
-    let parent = destination
+    let ext_dst = to_long_path(destination);
+    let parent = ext_dst
         .parent()
         .ok_or_else(|| SecurityError::StagingInspection {
             code: "PROMOTE_FAILED",
@@ -848,11 +910,7 @@ pub fn atomic_promote(raw_bytes: &[u8], destination: &Path) -> Result<(), Securi
         detail: e.to_string(),
     })?;
 
-    let name = destination
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("output");
-    let tmp_path = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let tmp_path = parent.join(format!(".ls-tmp-{}.tmp", uuid::Uuid::new_v4().simple()));
     {
         let mut fh = fs::File::create(&tmp_path).map_err(|e| SecurityError::StagingInspection {
             code: "PROMOTE_FAILED",
@@ -868,7 +926,7 @@ pub fn atomic_promote(raw_bytes: &[u8], destination: &Path) -> Result<(), Securi
             })?;
     }
 
-    replace_file_atomically(&tmp_path, destination).map_err(|e| {
+    replace_file_atomically(&tmp_path, &ext_dst).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
         SecurityError::StagingInspection {
             code: "PROMOTE_FAILED",

@@ -6,12 +6,22 @@ use std::path::{Path, PathBuf};
 use lecture_studio_history::{
     read_jsonl_strict, DecisionRecord, OperationRecord, SnapshotManifest, CANONICAL_CONTENT_DIRS,
 };
+use lecture_studio_security::staging::{atomic_promote, to_long_path};
 use rusqlite::{params, Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::WorkspaceError;
+use crate::lock::ProjectLockGuard;
 use crate::models::{IndexRebuildStats, ProjectConfig, SourceRecord};
-use crate::path_guard::ensure_no_symlink_in_path;
+use crate::path_guard::{ensure_no_symlink_in_path, validate_relative_path};
+
+const INDEX_REBUILD_JOURNAL: &str = ".index_rebuild_journal.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexRebuildJournal {
+    temp_db_name: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceSqliteIndex {
@@ -33,10 +43,11 @@ impl WorkspaceSqliteIndex {
 
     /// Check SQLite integrity and presence of core derived tables.
     pub fn verify_integrity(&self) -> Result<bool, WorkspaceError> {
-        if !self.db_path.exists() {
+        let ext_db = to_long_path(&self.db_path);
+        if !ext_db.exists() {
             return Ok(false);
         }
-        let Ok(conn) = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let Ok(conn) = Connection::open_with_flags(&ext_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
         else {
             return Ok(false);
         };
@@ -52,6 +63,44 @@ impl WorkspaceSqliteIndex {
         Ok(matches!(table_count, Ok(6)))
     }
 
+    /// Clean up ONLY the app-recorded temporary index DB file from an interrupted rebuild.
+    pub fn cleanup_recorded_index_temp(&self) -> Result<usize, WorkspaceError> {
+        let Some(cache_dir) = self.db_path.parent() else {
+            return Ok(0);
+        };
+        let lock_res = ProjectLockGuard::acquire_at(cache_dir.join(".index.lock"));
+        let _lock = match lock_res {
+            Ok(g) => g,
+            Err(e) if e.code() == "LOCK_CONTENTION" => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let journal_path = to_long_path(&cache_dir.join(INDEX_REBUILD_JOURNAL));
+        if !journal_path.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        if let Ok(raw) = fs::read_to_string(&journal_path) {
+            if let Ok(j) = serde_json::from_str::<IndexRebuildJournal>(&raw) {
+                if validate_relative_path(&j.temp_db_name).is_ok()
+                    && !j.temp_db_name.contains('/')
+                    && !j.temp_db_name.contains('\\')
+                    && j.temp_db_name.starts_with(".workspace_index.")
+                {
+                    let candidate = cache_dir.join(&j.temp_db_name);
+                    let ext_cand = to_long_path(&candidate);
+                    if ext_cand.exists()
+                        && ensure_no_symlink_in_path(&candidate).is_ok()
+                        && fs::remove_file(&ext_cand).is_ok()
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&journal_path);
+        Ok(removed)
+    }
+
     /// Rebuild the entire SQLite index from canonical workspace files and replace atomically.
     pub fn rebuild_from_canonical(
         &self,
@@ -61,10 +110,20 @@ impl WorkspaceSqliteIndex {
             .db_path
             .parent()
             .ok_or_else(|| WorkspaceError::new("INVALID_INDEX_PATH", "no parent dir"))?;
-        fs::create_dir_all(cache_dir)
+        fs::create_dir_all(to_long_path(cache_dir))
             .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?;
+        let _idx_lock = ProjectLockGuard::acquire_at(cache_dir.join(".index.lock"))?;
 
-        let tmp_db = cache_dir.join(format!(".workspace_index.{}.sqlite.tmp", Uuid::new_v4()));
+        let tmp_name = format!(".workspace_index.{}.sqlite.tmp", Uuid::new_v4().simple());
+        let journal_path = cache_dir.join(INDEX_REBUILD_JOURNAL);
+        let journal_bytes = serde_json::to_vec(&IndexRebuildJournal {
+            temp_db_name: tmp_name.clone(),
+        })
+        .map_err(|e| WorkspaceError::new("SERIALIZE_ERROR", e.to_string()))?;
+        atomic_promote(&journal_bytes, &journal_path)?;
+
+        let tmp_db = cache_dir.join(&tmp_name);
+        let ext_tmp = to_long_path(&tmp_db);
         let mut stats = IndexRebuildStats {
             projects_indexed: 0,
             sources_indexed: 0,
@@ -75,7 +134,7 @@ impl WorkspaceSqliteIndex {
         };
 
         {
-            let mut conn = Connection::open(&tmp_db)
+            let mut conn = Connection::open(&ext_tmp)
                 .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
             conn.execute_batch(
                 "
@@ -151,7 +210,7 @@ impl WorkspaceSqliteIndex {
                     if !p_dir.is_dir() {
                         continue;
                     }
-                    let proj_yaml = p_dir.join("project.yaml");
+                    let proj_yaml = to_long_path(&p_dir.join("project.yaml"));
                     if !proj_yaml.exists() {
                         continue;
                     }
@@ -202,7 +261,7 @@ impl WorkspaceSqliteIndex {
                         stats.decisions_indexed += 1;
                     }
 
-                    let snaps_dir = p_dir.join("history").join("snapshots");
+                    let snaps_dir = to_long_path(&p_dir.join("history").join("snapshots"));
                     if snaps_dir.exists() {
                         for se in fs::read_dir(&snaps_dir)
                             .map_err(|e| WorkspaceError::new("IO_ERROR", e.to_string()))?
@@ -233,8 +292,9 @@ impl WorkspaceSqliteIndex {
                         }
                     }
 
+                    let ext_p_dir = to_long_path(&p_dir);
                     for sub in CANONICAL_CONTENT_DIRS {
-                        let sub_dir = p_dir.join(sub);
+                        let sub_dir = ext_p_dir.join(sub);
                         if !sub_dir.is_dir() {
                             continue;
                         }
@@ -251,7 +311,7 @@ impl WorkspaceSqliteIndex {
                                     stack.push(fp);
                                 } else if fp.is_file() {
                                     let rel = fp
-                                        .strip_prefix(&p_dir)
+                                        .strip_prefix(&ext_p_dir)
                                         .unwrap_or(&fp)
                                         .to_string_lossy()
                                         .replace('\\', "/");
@@ -276,13 +336,17 @@ impl WorkspaceSqliteIndex {
                 .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
         }
 
-        if self.db_path.exists() {
-            let _ = fs::remove_file(&self.db_path);
+        let ext_db = to_long_path(&self.db_path);
+        let ext_tmp = to_long_path(&tmp_db);
+        if ext_db.exists() {
+            let _ = fs::remove_file(&ext_db);
         }
-        fs::rename(&tmp_db, &self.db_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_db);
+        fs::rename(&ext_tmp, &ext_db).map_err(|e| {
+            let _ = fs::remove_file(&ext_tmp);
+            let _ = fs::remove_file(cache_dir.join(INDEX_REBUILD_JOURNAL));
             WorkspaceError::new("INDEX_REPLACE_FAILED", e.to_string())
         })?;
+        let _ = fs::remove_file(cache_dir.join(INDEX_REBUILD_JOURNAL));
         Ok(stats)
     }
 
@@ -293,8 +357,11 @@ impl WorkspaceSqliteIndex {
                 "SQLite derived index is missing or corrupted; rebuild required.",
             ));
         }
-        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
+        let conn = Connection::open_with_flags(
+            to_long_path(&self.db_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
 
         let mut results = Vec::new();
         if query.chars().count() >= 3 {
@@ -341,8 +408,11 @@ impl WorkspaceSqliteIndex {
                 ))
             }
         };
-        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
+        let conn = Connection::open_with_flags(
+            to_long_path(&self.db_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;
         let count: i64 = conn
             .query_row(sql, [], |r| r.get(0))
             .map_err(|e| WorkspaceError::new("INDEX_ERROR", e.to_string()))?;

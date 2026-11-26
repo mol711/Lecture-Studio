@@ -155,6 +155,33 @@ pub struct IndexRebuildStats {
     pub files_indexed: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitPhase {
+    Prepared,
+    Audited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitJournal {
+    pub schema_version: String,
+    pub tx_id: String,
+    pub project_id: String,
+    pub target_rel_path: String,
+    pub base_revision: u64,
+    pub target_revision: u64,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    pub after_size_bytes: u64,
+    pub actor: String,
+    pub op_event_id: String,
+    pub timestamp_utc: String,
+    pub staged_temp_rel_path: String,
+    pub audit_id: Option<String>,
+    pub phase: CommitPhase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryReport {
     pub audit_dropped_lines: usize,
@@ -162,6 +189,9 @@ pub struct RecoveryReport {
     pub sources_dropped_lines: usize,
     pub exchange_keys_dropped_lines: usize,
     pub project_history_dropped_lines: usize,
+    pub rolled_back_journals: usize,
+    pub rolled_forward_journals: usize,
+    pub skipped_locked_projects: usize,
     pub removed_orphan_temps: usize,
     pub index_rebuilt: bool,
     pub index_stats: IndexRebuildStats,

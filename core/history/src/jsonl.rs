@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use lecture_studio_security::staging::atomic_promote;
+use lecture_studio_security::staging::{atomic_promote, to_long_path};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
@@ -14,7 +14,8 @@ use crate::models::TailRecoveryReport;
 
 /// Append one single-line JSON record and flush/sync to disk.
 pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), HistoryError> {
-    if let Some(parent) = path.parent() {
+    let ext = to_long_path(path);
+    if let Some(parent) = ext.parent() {
         fs::create_dir_all(parent).map_err(|e| HistoryError::Io {
             code: "CREATE_DIR_FAILED",
             message: format!("{}: {e}", parent.display()),
@@ -24,7 +25,7 @@ pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), 
     let mut fh = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&ext)
         .map_err(|e| HistoryError::Io {
             code: "JSONL_OPEN_FAILED",
             message: format!("{}: {e}", path.display()),
@@ -41,10 +42,11 @@ pub fn append_jsonl_record<T: Serialize>(path: &Path, record: &T) -> Result<(), 
 
 /// Strictly parse all records in a JSONL file; rejects malformed lines rather than ignoring them.
 pub fn read_jsonl_strict<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, HistoryError> {
-    if !path.exists() {
+    let ext = to_long_path(path);
+    if !ext.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read(path).map_err(|e| HistoryError::Io {
+    let raw = fs::read(&ext).map_err(|e| HistoryError::Io {
         code: "JSONL_READ_FAILED",
         message: format!("{}: {e}", path.display()),
     })?;
@@ -68,7 +70,8 @@ pub fn read_jsonl_strict<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, His
 pub fn recover_jsonl_tail<T: DeserializeOwned>(
     path: &Path,
 ) -> Result<TailRecoveryReport, HistoryError> {
-    if !path.exists() {
+    let ext = to_long_path(path);
+    if !ext.exists() {
         return Ok(TailRecoveryReport {
             file_path: path.display().to_string(),
             valid_records: 0,
@@ -76,7 +79,7 @@ pub fn recover_jsonl_tail<T: DeserializeOwned>(
             sidecar_path: None,
         });
     }
-    let raw = fs::read(path).map_err(|e| HistoryError::Io {
+    let raw = fs::read(&ext).map_err(|e| HistoryError::Io {
         code: "JSONL_READ_FAILED",
         message: format!("{}: {e}", path.display()),
     })?;
